@@ -280,8 +280,11 @@ Metrics collection (`Get-AzMetric`) is the most time-consuming operation. Use `-
 ## Disclaimer
 
 This project is provided "AS IS", without warranty of any kind.
+
 This script is an independent community project and is not officially supported, endorsed, or maintained by Microsoft.
+
 Use at your own risk. Always validate scripts in a non-production environment before deploying to production systems.
+
 The author assumes no liability for damages, data loss, service interruption, unexpected costs, or other issues resulting from the use of this script.
 
 ---
@@ -289,4 +292,3 @@ The author assumes no liability for damages, data loss, service interruption, un
 ## License
 
 This script is proprietary and confidential. Unauthorized copying, modification, distribution, or reverse engineering is prohibited. See the confidentiality notice in the script header for details.
-
