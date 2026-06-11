@@ -415,8 +415,7 @@ function Test-PreFlightPermissions {
         if ($rg -or $true) { $readerOk = $true }  # If Set-AzContext succeeded, Reader is enough
         Add-CheckResult "Reader on Subscriptions" "Subscription ($($SubscriptionIds.Count) subs)" "PASS" "Can read resources in subscriptions"
     } catch {
-        Add-CheckResult "Reader on Subscriptions" "Subscription" "FAIL" "Cannot access subscription: $($_.Exception.Message)"
-        $hasBlocker = $true
+        Add-CheckResult "Reader on Subscriptions" "Subscription" "WARN" "Cannot access subscription: $($_.Exception.Message) — will attempt with available subs" -Required $false
     }
 
     # ── 3. Cost Management Reader ──
@@ -460,10 +459,10 @@ function Test-PreFlightPermissions {
                     Add-CheckResult "MG Hierarchy (Recursive)" "Tenant Root" "WARN" "Can list MGs but cannot expand full hierarchy — partial ALZ view" -Required $false
                 }
             } else {
-                Add-CheckResult "Management Group Reader" "Tenant Root" "FAIL" "No management groups accessible"
+                Add-CheckResult "Management Group Reader" "Tenant Root" "WARN" "No management groups accessible — MG analysis will be skipped" -Required $false
             }
         } catch {
-            Add-CheckResult "Management Group Reader" "Tenant Root" "FAIL" "Cannot read Management Groups: $($_.Exception.Message). Assign 'Management Group Reader' at tenant root."
+            Add-CheckResult "Management Group Reader" "Tenant Root" "WARN" "Cannot read Management Groups: $($_.Exception.Message) — MG analysis will be skipped" -Required $false
         }
 
         # ── 6. MG-scope Policy Assignments ──
@@ -473,7 +472,7 @@ function Test-PreFlightPermissions {
             Add-CheckResult "MG-scope Policy Read" "Management Group" "PASS" "Can read policy assignments at MG scope"
         } catch {
             if ($_.Exception.Message -match 'AuthorizationFailed|Forbidden|does not have authorization') {
-                Add-CheckResult "MG-scope Policy Read" "Management Group" "FAIL" "Cannot read MG-scope policies — assign Reader at MG level" -Required $false
+                Add-CheckResult "MG-scope Policy Read" "Management Group" "WARN" "Cannot read MG-scope policies — assign Reader at MG level for full coverage" -Required $false
             } else {
                 Add-CheckResult "MG-scope Policy Read" "Management Group" "WARN" "MG policy check inconclusive: $($_.Exception.Message)" -Required $false
             }
