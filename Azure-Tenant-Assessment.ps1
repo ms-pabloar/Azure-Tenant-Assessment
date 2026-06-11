@@ -12276,7 +12276,7 @@ svg{display:block;margin:0 auto}
 .legend-item{display:flex;align-items:center;gap:6px;font-weight:500}
 .tip{position:fixed;padding:10px 14px;background:#fff;border:1px solid #e1e5ea;border-radius:8px;color:#1a1a2e;font-size:12px;pointer-events:none;z-index:99;display:none;box-shadow:0 4px 16px rgba(0,29,61,.1);max-width:300px;line-height:1.5}
 </style></head><body>
-<div class="hdr"><svg width="110" height="24" viewBox="0 0 110 24"><rect width="10" height="10" fill="#f25022"/><rect x="12" width="10" height="10" fill="#7fba00"/><rect y="12" width="10" height="10" fill="#00a4ef"/><rect x="12" y="12" width="10" height="10" fill="#ffb900"/><text x="30" y="17" fill="#1a1a2e" font-family="Segoe UI" font-size="13" font-weight="600">Microsoft Azure</text></svg></div>
+<div class="hdr"><svg width="140" height="24" viewBox="0 0 140 24"><rect width="10" height="10" fill="#f25022"/><rect x="12" width="10" height="10" fill="#7fba00"/><rect y="12" width="10" height="10" fill="#00a4ef"/><rect x="12" y="12" width="10" height="10" fill="#ffb900"/><text x="30" y="17" fill="#1a1a2e" font-family="Segoe UI" font-size="13" font-weight="600">Microsoft Azure</text></svg></div>
 <h1>Network Topology</h1>
 <p class="sub">$(Get-Date -Format "dd/MM/yyyy HH:mm") &ensp;|&ensp; $($vnets.Count) VNet(s) &ensp;|&ensp; $($pips.Count) Public IP(s) &ensp;|&ensp; $($edgeItems.Count) Edge device(s)$(if($natGwNames.Count -gt 0){" &ensp;|&ensp; $($natGwNames.Count) NAT Gateway(s)"})</p>
 <svg viewBox="0 0 $totalW $totalH" xmlns="http://www.w3.org/2000/svg" style="max-width:${totalW}px;width:100%">
@@ -14318,17 +14318,17 @@ try {
 # VQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBH
 # NCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYgMjAyNSBDQTECEAqA7xhLjfEF
 # gtHEdqeVdGgwDQYJYIZIAWUDBAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcN
-# AQcBMBwGCSqGSIb3DQEJBTEPFw0yNjA1MjUyMjU0MDlaMC8GCSqGSIb3DQEJBDEi
+# AQcBMBwGCSqGSIb3DQEJBTEPFw0yNjA1MjUyMjU0MDFaMC8GCSqGSIb3DQEJBDEi
 # BCCYktL09zBCBkdXF9D2vguwKuHps/lEkbngJdo3KFuvJzANBgkqhkiG9w0BAQEF
-# AASCAgAmypRcmQlHfE7867wmrFF4p3boUp8fgbMdscJsGE82/5uBAxwnky1Kf50e
-# RyXYcIimUYScGktATKaJ7ZbCmeB1eYUXkexh7cvQY1ZM7rKvDZNUTlkl3GtbrnU+
-# xlq3SJ8BGhoBnDiPX3G/efRt5A+qnY95UaJL3BV3+Ai9y1UAdj8SaQORYv9KOVpI
-# ytbCSi62QFwZQwS40iTA8C0FF2UufLqB5OeRXYueiRNi9k1jyPyFKTiH5+7xEjzx
-# 55aYHrpQSNIWjM5Uxx/i62AbhH20vSlb4M6c1I1WqaORbp3lKtcSE4KX2lTf1ulE
-# I9LvirloXnFh2Anjq3qGP674GJJhV5XgEMD9d6OirsYDXJGZ+jCjqycxk2WG3x8W
-# ZZ8ju3Iru8qTK54itDne28o1RtIiToO8EhjMAY7Vb2QG2thDOnKs4qujIL+MmbtH
-# iZWsf7ITnVaf5at8jF3eQMo35qFbVcXCCuYgYCjdSbgcfQKBlJF/SbaZE2eKfbM/
-# QDWzSbznr4K359VVQRGmUd6HUvDXY5J/0RSpWuqXMenHoYhKbye2IBYWO1UMtEDW
-# A9XnkaNmb63hr351O6NWox5WxhcEjk0HSL9l1fjszhbwfKlmHbZVhqyN3MKkgswX
-# z/5G/jtraivahhYyFJSAIIWV9o81kgVvjVVLqLqFxJhH1piF7Q==
+# AASCAgBei+gKvvyGzX8Pkvf6Mxq7XeveVy8X9vfq6qyJBsq+NNDuGQRdszyLWwBc
+# VAzMj8x3ljLNnOqQPhP+HuaqGFfGD4s36Qpe6Awx+GU/adCM2igYgpSyNvVwSZ+l
+# il7i/AesuMt1QNo0MRFDwbfv0lU5ltYRRFzT52VFKSnyDV3Eac805EnUT9BzKizF
+# GSkKZSA5I5C0l/nZGKVck6IU395oCWBhoF6gXeif9OBm5RJNMy052SCpiL4reFED
+# o+63y+k8g/sgQzqMKsAEiRinlrrj+Yd1xK3EYJzS8njip35MJpJrjT5+eHFs3oWt
+# GHyJSHgxO1Av5xCM7VEsrJFC/m3msWrdAJ99cvYPAWYULIJxBkXwAnHNnpppXM4u
+# 03GJAZaJIro0pZnjooK0YgFTpJ4DxNguGIiGbEdGSd1zX+o9K1+rb0vzKTjkApRl
+# HCEw/InfJjggvomS6Dxbxy1vCvIcgnuh3Cj8MfPjYyCEJ9m1AoHeSbyIgh0r3krB
+# QWbXWjzg7s7ZorpIGfx/FrxGjOzAp//fqRV+sIH6yT79wM3u8X0IoNV8J+IUznjw
+# quBkPhPjbOEVTUKq8zUzP4XoZ+KDExf/hktbwrD9ukcAoakamYHCVwp4TwqOFcfK
+# f2UgOBUJZDXWvjaxgVO8pRhgaa3e90yLd5pwPWk5E/iGonaU7w==
 # SIG # End signature block
