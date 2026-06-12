@@ -5323,6 +5323,272 @@ function Analyze-ExpiringSecrets {
     Write-Status "  Expiring secrets & certificates analysis complete" "OK"
 }
 
+# ============================================================================
+# 19. AZURE MARKETPLACE DEPLOYED PRODUCTS ANALYSIS
+# ============================================================================
+function Analyze-Marketplace {
+    param([string]$SubId, [string]$SubName)
+
+    Write-Status "Analyzing Azure Marketplace deployments..." "SECTION"
+
+    # ── 1. Discover all Marketplace resources via Resource Graph ──
+    $mpQuery = @"
+resources
+| where isnotnull(properties.marketplaceOrderId) or
+        (plan.publisher != '' and plan.publisher !startswith 'Microsoft') or
+        (type contains 'microsoft.saas') or
+        (type contains 'microsoft.solutions/applications')
+| extend publisher = coalesce(plan.publisher, properties.publisherId, 'Unknown'),
+         product   = coalesce(plan.product, properties.offerId, name),
+         planName  = coalesce(plan.name, properties.skuId, 'N/A'),
+         planVer   = coalesce(plan.version, properties.term, 'N/A')
+| project id, name, type, resourceGroup, location, publisher, product, planName, planVer,
+          provisioningState = tostring(properties.provisioningState),
+          createdTime       = tostring(properties.createdTime)
+"@
+
+    $mpResources = @()
+    try {
+        $mpResources = @(Search-AzGraph -Query $mpQuery -Subscription $SubId -First 1000 -ErrorAction Stop)
+    } catch {
+        Write-Status "  Resource Graph query for Marketplace failed, falling back to REST API" "WARN"
+    }
+
+    # ── Fallback: REST API to discover SaaS resources ──
+    $saasResources = @()
+    try {
+        $saasResp = Invoke-AzRestMethod -Path "/subscriptions/$SubId/providers/Microsoft.SaaS/resources?api-version=2018-03-01-beta" -Method GET -ErrorAction Stop
+        if ($saasResp.StatusCode -eq 200) {
+            $saasData = ($saasResp.Content | ConvertFrom-Json).value
+            if ($saasData) { $saasResources = @($saasData) }
+        }
+    } catch { }
+
+    # ── Fallback: List Managed Applications ──
+    $managedApps = @()
+    try {
+        $maResp = Invoke-AzRestMethod -Path "/subscriptions/$SubId/providers/Microsoft.Solutions/applications?api-version=2021-07-01" -Method GET -ErrorAction Stop
+        if ($maResp.StatusCode -eq 200) {
+            $maData = ($maResp.Content | ConvertFrom-Json).value
+            if ($maData) { $managedApps = @($maData) }
+        }
+    } catch { }
+
+    $allMpItems = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    # Process Resource Graph results
+    foreach ($r in $mpResources) {
+        $allMpItems.Add([PSCustomObject]@{
+            Name              = $r.name
+            Type              = $r.type
+            ResourceGroup     = $r.resourceGroup
+            Publisher         = [string]$r.publisher
+            Product           = [string]$r.product
+            Plan              = [string]$r.planName
+            Version           = [string]$r.planVer
+            ProvisioningState = [string]$r.provisioningState
+            Source            = "ResourceGraph"
+        })
+    }
+
+    # Process SaaS resources
+    foreach ($s in $saasResources) {
+        $sProp = $s.properties
+        $existing = $allMpItems | Where-Object { $_.Name -eq $s.name }
+        if (-not $existing) {
+            $allMpItems.Add([PSCustomObject]@{
+                Name              = $s.name
+                Type              = $s.type
+                ResourceGroup     = if ($s.id -match '/resourceGroups/([^/]+)/') { $Matches[1] } else { 'N/A' }
+                Publisher         = [string]$sProp.publisherId
+                Product           = [string]$sProp.offerId
+                Plan              = [string]$sProp.skuId
+                Version           = [string]$sProp.term
+                ProvisioningState = [string]$sProp.saasResourceStatus
+                Source            = "SaaS"
+            })
+        }
+    }
+
+    # Process Managed Applications
+    foreach ($ma in $managedApps) {
+        $maProp = $ma.properties
+        $existing = $allMpItems | Where-Object { $_.Name -eq $ma.name }
+        if (-not $existing) {
+            $allMpItems.Add([PSCustomObject]@{
+                Name              = $ma.name
+                Type              = $ma.type
+                ResourceGroup     = if ($ma.id -match '/resourceGroups/([^/]+)/') { $Matches[1] } else { 'N/A' }
+                Publisher         = [string]$maProp.publisherTenantId
+                Product           = [string]$maProp.managedResourceGroupId
+                Plan              = if ($ma.plan) { [string]$ma.plan.name } else { 'N/A' }
+                Version           = if ($ma.plan) { [string]$ma.plan.version } else { 'N/A' }
+                ProvisioningState = [string]$maProp.provisioningState
+                Source            = "ManagedApp"
+            })
+        }
+    }
+
+    $totalMp = $allMpItems.Count
+    Write-Status "  Marketplace products found: $totalMp" "INFO"
+
+    if ($totalMp -eq 0) {
+        Write-Status "  No Marketplace deployments detected" "OK"
+        return
+    }
+
+    # ── Store in inventory for report ──
+    if (-not $script:MarketplaceInventory) { $script:MarketplaceInventory = [System.Collections.Generic.List[PSCustomObject]]::new() }
+    foreach ($item in $allMpItems) {
+        $script:MarketplaceInventory.Add([PSCustomObject]@{
+            Subscription      = $SubName
+            Name              = $item.Name
+            Type              = $item.Type
+            ResourceGroup     = $item.ResourceGroup
+            Publisher         = $item.Publisher
+            Product           = $item.Product
+            Plan              = $item.Plan
+            Version           = $item.Version
+            ProvisioningState = $item.ProvisioningState
+        })
+    }
+
+    # ── 2. Check provisioning state — failed or suspended deployments ──
+    $failedItems = $allMpItems | Where-Object { $_.ProvisioningState -and $_.ProvisioningState -notin @('Succeeded','Active','Running','Ready','Subscribed','') }
+    foreach ($f in $failedItems) {
+        $sev = if ($f.ProvisioningState -in @('Failed','Suspended','Unsubscribed','Deleted')) { 'High' } else { 'Medium' }
+        Add-Finding -Pillar "Operational Excellence" -Severity $sev -Category "Marketplace - Unhealthy Deployment" `
+            -ResourceName $f.Name -ResourceType $f.Type -ResourceGroup $f.ResourceGroup `
+            -Subscription $SubName `
+            -Description "Marketplace product '$($f.Name)' (publisher: $($f.Publisher)) is in state '$($f.ProvisioningState)'." `
+            -Recommendation "Investigate the deployment status. If no longer needed, remove to avoid billing. If needed, redeploy or contact the publisher." `
+            -Impact "Unhealthy Marketplace deployments may still incur charges while not providing value."
+    }
+
+    # ── 3. Check for deprecated/delisted offers ──
+    $publisherGroups = $allMpItems | Group-Object Publisher
+    foreach ($pg in $publisherGroups) {
+        $publisherName = $pg.Name
+        if ([string]::IsNullOrWhiteSpace($publisherName) -or $publisherName -eq 'Unknown') { continue }
+        foreach ($item in $pg.Group) {
+            try {
+                $offerPath = "/subscriptions/$SubId/providers/Microsoft.Marketplace/offerTypes/VirtualMachine/publishers/$($item.Publisher)/offers?api-version=2018-03-01-beta"
+                $offerResp = Invoke-AzRestMethod -Path $offerPath -Method GET -ErrorAction SilentlyContinue
+                if ($offerResp -and $offerResp.StatusCode -eq 404) {
+                    Add-Finding -Pillar "Operational Excellence" -Severity "High" -Category "Marketplace - Delisted Offer" `
+                        -ResourceName $item.Name -ResourceType $item.Type -ResourceGroup $item.ResourceGroup `
+                        -Subscription $SubName `
+                        -Description "Marketplace product '$($item.Name)' from publisher '$($item.Publisher)' may be delisted or no longer available." `
+                        -Recommendation "Verify the product is still supported. Plan migration to a supported alternative before the publisher removes support entirely." `
+                        -Impact "Delisted products will not receive security patches or updates, increasing vulnerability risk."
+                }
+            } catch { }
+        }
+    }
+
+    # ── 4. Publisher verification status ──
+    $unknownPublishers = $allMpItems | Where-Object { [string]::IsNullOrWhiteSpace($_.Publisher) -or $_.Publisher -eq 'Unknown' }
+    foreach ($u in $unknownPublishers) {
+        Add-Finding -Pillar "Security" -Severity "Medium" -Category "Marketplace - Unknown Publisher" `
+            -ResourceName $u.Name -ResourceType $u.Type -ResourceGroup $u.ResourceGroup `
+            -Subscription $SubName `
+            -Description "Marketplace product '$($u.Name)' has no identifiable publisher information." `
+            -Recommendation "Verify the origin and legitimacy of this deployment. Consider removing unverified third-party solutions." `
+            -Impact "Products from unverified publishers may pose security risks or lack proper support."
+    }
+
+    # ── 5. Version analysis — detect potentially outdated versions ──
+    $versionedItems = $allMpItems | Where-Object { $_.Version -and $_.Version -ne 'N/A' -and $_.Version -ne '' }
+    $productVersionGroups = $versionedItems | Group-Object Product
+    foreach ($pvg in $productVersionGroups) {
+        if ($pvg.Count -le 1) { continue }
+        $versions = $pvg.Group | ForEach-Object { $_.Version } | Sort-Object -Unique
+        if ($versions.Count -gt 1) {
+            $latestVer = $versions | Select-Object -Last 1
+            $outdated = $pvg.Group | Where-Object { $_.Version -ne $latestVer }
+            foreach ($old in $outdated) {
+                Add-Finding -Pillar "Operational Excellence" -Severity "Medium" -Category "Marketplace - Outdated Version" `
+                    -ResourceName $old.Name -ResourceType $old.Type -ResourceGroup $old.ResourceGroup `
+                    -Subscription $SubName `
+                    -Description "Marketplace product '$($old.Name)' is running version '$($old.Version)' while version '$latestVer' exists in the same subscription." `
+                    -Recommendation "Update to the latest version to get security patches, bug fixes, and new features." `
+                    -Impact "Running outdated versions may expose the environment to known vulnerabilities."
+            }
+        }
+    }
+
+    # ── 6. Cost analysis for Marketplace items ──
+    try {
+        $mpCostBody = @{
+            type = "ActualCost"
+            dataSet = @{
+                granularity = "None"
+                aggregation = @{ totalCost = @{ name = "Cost"; function = "Sum" } }
+                filter = @{
+                    dimensions = @{
+                        name = "PublisherType"
+                        operator = "In"
+                        values = @("Marketplace","AWS")
+                    }
+                }
+                grouping = @(@{ type = "Dimension"; name = "PublisherName" })
+            }
+            timeframe = "MonthToDate"
+        } | ConvertTo-Json -Depth 10
+        $costResp = Invoke-AzRestMethod -Path "/subscriptions/$SubId/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Method POST -Payload $mpCostBody -ErrorAction Stop
+        if ($costResp.StatusCode -eq 200) {
+            $costData = ($costResp.Content | ConvertFrom-Json).properties
+            if ($costData.rows -and $costData.rows.Count -gt 0) {
+                $totalMpCost = ($costData.rows | ForEach-Object { $_[0] } | Measure-Object -Sum).Sum
+                Write-Status "  Marketplace MTD cost: `$$([math]::Round($totalMpCost, 2))" "INFO"
+                if ($totalMpCost -gt 1000) {
+                    $topPublisher = $costData.rows | Sort-Object { $_[0] } -Descending | Select-Object -First 1
+                    Add-Finding -Pillar "Cost Optimization" -Severity "Medium" -Category "Marketplace - High Spend" `
+                        -ResourceName "Marketplace Products" -ResourceType "Microsoft.Marketplace" -ResourceGroup "N/A" `
+                        -Subscription $SubName `
+                        -Description "Marketplace month-to-date spend is `$$([math]::Round($totalMpCost, 2)). Top publisher: '$($topPublisher[1])' (`$$([math]::Round($topPublisher[0], 2)))." `
+                        -Recommendation "Review Marketplace subscriptions for unused or underutilized products. Consider negotiating volume discounts or finding Azure-native alternatives." `
+                        -Impact "Third-party Marketplace costs can grow unchecked without proper governance and periodic review."
+                }
+                # Individual publisher costs
+                foreach ($row in $costData.rows) {
+                    if ($row[0] -gt 500) {
+                        if (-not $script:MarketplaceCosts) { $script:MarketplaceCosts = [System.Collections.Generic.List[PSCustomObject]]::new() }
+                        $script:MarketplaceCosts.Add([PSCustomObject]@{
+                            Subscription = $SubName
+                            Publisher    = $row[1]
+                            MtdCost      = [math]::Round($row[0], 2)
+                            Currency     = if ($row.Count -ge 3) { $row[2] } else { 'USD' }
+                        })
+                    }
+                }
+            }
+        } else {
+            Write-Status "  Cost data for Marketplace unavailable (HTTP $($costResp.StatusCode))" "WARN"
+        }
+    } catch {
+        Write-Status "  Marketplace cost analysis skipped (no Cost Management access)" "WARN"
+    }
+
+    # ── 7. Governance: resources without resource locks ──
+    foreach ($item in $allMpItems) {
+        if ($item.ResourceGroup -eq 'N/A') { continue }
+        try {
+            $lockCheck = Get-AzResourceLock -ResourceGroupName $item.ResourceGroup -ErrorAction SilentlyContinue
+            if (-not $lockCheck) {
+                Add-Finding -Pillar "Operational Excellence" -Severity "Low" -Category "Marketplace - No Lock" `
+                    -ResourceName $item.Name -ResourceType $item.Type -ResourceGroup $item.ResourceGroup `
+                    -Subscription $SubName `
+                    -Description "Marketplace product '$($item.Name)' (publisher: $($item.Publisher)) has no resource lock." `
+                    -Recommendation "Apply a CanNotDelete lock to prevent accidental removal of paid Marketplace deployments." `
+                    -Impact "Accidental deletion of a Marketplace resource may cause service disruption and require re-procurement."
+            }
+        } catch { }
+    }
+
+    Write-Status "  Marketplace analysis complete — $totalMp product(s) evaluated" "OK"
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # FUNCTION 20: Tag Compliance Analysis
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -14022,6 +14288,7 @@ function Main {
         Invoke-AnalysisStep "BCDR"                     $sub.Id $sub.Name { Analyze-BCDR                   -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "ResourceLocks"            $sub.Id $sub.Name { Analyze-ResourceLocks          -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "ExpiringSecrets"          $sub.Id $sub.Name { Analyze-ExpiringSecrets        -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStep "Marketplace"              $sub.Id $sub.Name { Analyze-Marketplace            -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "TagCompliance"            $sub.Id $sub.Name { Analyze-TagCompliance          -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "DiagnosticSettings"       $sub.Id $sub.Name { Analyze-DiagnosticSettings     -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "PrivateEndpoints"         $sub.Id $sub.Name { Analyze-PrivateEndpoints       -SubId $sub.Id -SubName $sub.Name }
