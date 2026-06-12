@@ -5517,8 +5517,10 @@ resources
         }
     }
 
-    # ── 6. Cost analysis for Marketplace items ──
+    # ── 6. Cost analysis for Marketplace items (6-month trend by publisher) ──
+    if (-not $script:MarketplaceCostData) { $script:MarketplaceCostData = @{} }
     try {
+        # 6a. Month-to-date finding for high spend
         $mpCostBody = @{
             type = "ActualCost"
             dataSet = @{
@@ -5550,10 +5552,9 @@ resources
                         -Recommendation "Review Marketplace subscriptions for unused or underutilized products. Consider negotiating volume discounts or finding Azure-native alternatives." `
                         -Impact "Third-party Marketplace costs can grow unchecked without proper governance and periodic review."
                 }
-                # Individual publisher costs
+                if (-not $script:MarketplaceCosts) { $script:MarketplaceCosts = [System.Collections.Generic.List[PSCustomObject]]::new() }
                 foreach ($row in $costData.rows) {
                     if ($row[0] -gt 500) {
-                        if (-not $script:MarketplaceCosts) { $script:MarketplaceCosts = [System.Collections.Generic.List[PSCustomObject]]::new() }
                         $script:MarketplaceCosts.Add([PSCustomObject]@{
                             Subscription = $SubName
                             Publisher    = $row[1]
@@ -5563,8 +5564,91 @@ resources
                     }
                 }
             }
+        }
+
+        # 6b. Full 6-month monthly breakdown by publisher (for trend charts)
+        $endDate = (Get-Date).ToString("yyyy-MM-dd")
+        $startDate = (Get-Date).AddMonths(-6).ToString("yyyy-MM-dd")
+        $mpMonthlyBody = @{
+            type = "ActualCost"
+            dataSet = @{
+                granularity = "Monthly"
+                aggregation = @{ totalCost = @{ name = "Cost"; function = "Sum" } }
+                filter = @{
+                    dimensions = @{
+                        name = "PublisherType"
+                        operator = "In"
+                        values = @("Marketplace","AWS")
+                    }
+                }
+                grouping = @(@{ type = "Dimension"; name = "PublisherName" })
+            }
+            timeframe = "Custom"
+            timePeriod = @{ from = $startDate; to = $endDate }
+        } | ConvertTo-Json -Depth 10
+
+        $monthlyResp = Invoke-AzRestMethod -Path "/subscriptions/$SubId/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Method POST -Payload $mpMonthlyBody -ErrorAction Stop
+        if ($monthlyResp.StatusCode -eq 200) {
+            $monthlyResult = ($monthlyResp.Content | ConvertFrom-Json).properties
+            $mRows = $monthlyResult.rows
+            $mCols = $monthlyResult.columns
+            if ($mRows -and $mRows.Count -gt 0) {
+                $costIdx = -1; $pubIdx = -1; $monthIdx = -1
+                for ($ci = 0; $ci -lt $mCols.Count; $ci++) {
+                    if ($mCols[$ci].name -eq "Cost") { $costIdx = $ci }
+                    elseif ($mCols[$ci].name -eq "PublisherName") { $pubIdx = $ci }
+                    elseif ($mCols[$ci].name -eq "BillingMonth" -or $mCols[$ci].name -eq "UsageDate") { $monthIdx = $ci }
+                }
+                if ($costIdx -ge 0 -and $pubIdx -ge 0 -and $monthIdx -ge 0) {
+                    $mpMonthlyByPub = @{}
+                    $mpAllMonths = [System.Collections.Generic.SortedSet[string]]::new()
+                    $mpTotalByPub = @{}
+                    foreach ($row in $mRows) {
+                        $cost = [double]$row[$costIdx]
+                        $pub = [string]$row[$pubIdx]
+                        $monthRaw = [string]$row[$monthIdx]
+                        $monthKey = $monthRaw
+                        try {
+                            $parsedDate = [datetime]::Parse($monthRaw)
+                            $monthKey = $parsedDate.ToString('yyyy-MM')
+                        } catch {
+                            if ($monthRaw -match '^(\d{4})-(\d{1,2})') { $monthKey = '{0}-{1:D2}' -f [int]$Matches[1], [int]$Matches[2] }
+                            elseif ($monthRaw -match '^(\d{4})(\d{2})') { $monthKey = '{0}-{1}' -f $Matches[1], $Matches[2] }
+                        }
+                        [void]$mpAllMonths.Add($monthKey)
+                        if (-not $mpMonthlyByPub.ContainsKey($pub)) { $mpMonthlyByPub[$pub] = @{} }
+                        if (-not $mpMonthlyByPub[$pub].ContainsKey($monthKey)) { $mpMonthlyByPub[$pub][$monthKey] = 0 }
+                        $mpMonthlyByPub[$pub][$monthKey] += $cost
+                        if (-not $mpTotalByPub.ContainsKey($pub)) { $mpTotalByPub[$pub] = 0 }
+                        $mpTotalByPub[$pub] += $cost
+                    }
+                    $mpTopPubs = $mpTotalByPub.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 10
+                    $mpTotalCost6m = ($mpTotalByPub.Values | Measure-Object -Sum).Sum
+                    $mpMonths = @($mpAllMonths)
+                    $mpGrowth = @{}
+                    if ($mpMonths.Count -ge 2) {
+                        $fm = $mpMonths[0]; $lm = $mpMonths[-1]
+                        foreach ($p in $mpTopPubs) {
+                            $fv = if ($mpMonthlyByPub[$p.Key].ContainsKey($fm)) { $mpMonthlyByPub[$p.Key][$fm] } else { 0 }
+                            $lv = if ($mpMonthlyByPub[$p.Key].ContainsKey($lm)) { $mpMonthlyByPub[$p.Key][$lm] } else { 0 }
+                            $mpGrowth[$p.Key] = if ($fv -gt 0) { [math]::Round((($lv - $fv) / $fv) * 100, 1) } else { if ($lv -gt 0) { 100 } else { 0 } }
+                        }
+                    }
+                    $mpCurrency = if ($mCols | Where-Object { $_.name -eq "Currency" }) { $mRows[0][-1] } else { "USD" }
+                    $script:MarketplaceCostData[$SubId] = @{
+                        SubName          = $SubName
+                        TotalCost        = [math]::Round($mpTotalCost6m, 2)
+                        TopPublishers    = $mpTopPubs
+                        MonthlyByPub     = $mpMonthlyByPub
+                        Months           = $mpMonths
+                        Growth           = $mpGrowth
+                        Currency         = $mpCurrency
+                    }
+                    Write-Status "  Marketplace 6-month cost: `$$([math]::Round($mpTotalCost6m, 0)) ($($mpMonths.Count) months, $($mpTotalByPub.Count) publishers)" "OK"
+                }
+            }
         } else {
-            Write-Status "  Cost data for Marketplace unavailable (HTTP $($costResp.StatusCode))" "WARN"
+            Write-Status "  Marketplace monthly cost data unavailable (HTTP $($monthlyResp.StatusCode))" "WARN"
         }
     } catch {
         Write-Status "  Marketplace cost analysis skipped (no Cost Management access)" "WARN"
@@ -8766,6 +8850,188 @@ function Generate-HTMLReport {
     }
     $mpCostRows = $mpCostRowsBuilder.ToString()
 
+    # Marketplace 6-month cost trend HTML (same style as main Cost section)
+    $mpCostTrendHtml = [System.Text.StringBuilder]::new()
+    foreach ($s in $script:Subscriptions) {
+        $mpCost = $script:MarketplaceCostData[$s.Id]
+        if (-not $mpCost) { continue }
+
+        $safeName = ConvertTo-SafeHtml $s.Name
+        $currency = $mpCost.Currency
+        $months = @($mpCost.Months)
+        $monthLabels = @($months | ForEach-Object {
+            $m = $_
+            try {
+                if ($m -match '^(\d{4})-(\d{1,2})$') {
+                    ([datetime]::new([int]$Matches[1], [int]$Matches[2], 1)).ToString('MMM yyyy', [System.Globalization.CultureInfo]::InvariantCulture)
+                } else { ([datetime]::Parse($m)).ToString('MMM yyyy', [System.Globalization.CultureInfo]::InvariantCulture) }
+            } catch { $m }
+        })
+        $avgMonthly = if ($months.Count -gt 0) { [math]::Round($mpCost.TotalCost / $months.Count, 0) } else { 0 }
+        $topGrower = $null; $topGrowthVal = [double]-999
+        $maxCostPub = $null; $maxCostVal = [double]0
+        foreach ($pub in $mpCost.TopPublishers) {
+            if ($pub.Value -gt $maxCostVal) { $maxCostVal = $pub.Value; $maxCostPub = $pub.Key }
+            $gv = if ($mpCost.Growth.ContainsKey($pub.Key)) { [double]$mpCost.Growth[$pub.Key] } else { 0 }
+            if ($gv -gt $topGrowthVal) { $topGrowthVal = $gv; $topGrower = $pub.Key }
+        }
+        $topGrowthColor = if ($topGrowthVal -gt 20) { "#d13438" } elseif ($topGrowthVal -gt 0) { "#ca5010" } elseif ($topGrowthVal -lt 0) { "#107c10" } else { "#605e5c" }
+        $topGrowthIcon = if ($topGrowthVal -gt 0) { "&#9650;" } elseif ($topGrowthVal -lt 0) { "&#9660;" } else { "&#9644;" }
+
+        # Bar chart rows
+        $mpBarRows = ""; $rank = 0
+        foreach ($pub in $mpCost.TopPublishers) {
+            $rank++
+            $pct = if ($mpCost.TotalCost -gt 0) { [math]::Round(($pub.Value / $mpCost.TotalCost) * 100, 1) } else { 0 }
+            $barWidth = if ($maxCostVal -gt 0) { [math]::Round(($pub.Value / $maxCostVal) * 100, 1) } else { 0 }
+            $growthVal = if ($mpCost.Growth.ContainsKey($pub.Key)) { $mpCost.Growth[$pub.Key] } else { 0 }
+            $growthColor = if ($growthVal -gt 20) { "#d13438" } elseif ($growthVal -gt 0) { "#ca5010" } elseif ($growthVal -lt 0) { "#107c10" } else { "#605e5c" }
+            $growthIcon = if ($growthVal -gt 0) { "&#9650;" } elseif ($growthVal -lt 0) { "&#9660;" } else { "&#9644;" }
+            $barColor = switch ($rank) { 1 {"#5c2d91"} 2 {"#0078d4"} 3 {"#ca5010"} 4 {"#107c10"} 5 {"#008272"} 6 {"#d13438"} 7 {"#00b7c3"} 8 {"#8764b8"} 9 {"#498205"} 10 {"#da3b01"} default {"#8a8886"} }
+            $pubSafe = ConvertTo-SafeHtml $pub.Key
+            $mpBarRows += @"
+            <div style="display:grid;grid-template-columns:200px 1fr 90px 70px 80px;align-items:center;gap:12px;padding:8px 12px;border-bottom:1px solid #f3f2f1;font-size:13px;">
+                <div style="font-weight:600;color:#323130;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="$pubSafe">$pubSafe</div>
+                <div style="position:relative;height:24px;background:#f3f2f1;border-radius:4px;overflow:hidden;">
+                    <div style="position:absolute;left:0;top:0;bottom:0;width:${barWidth}%;background:linear-gradient(90deg,${barColor}dd,${barColor}99);border-radius:4px;transition:width .6s ease;"></div>
+                    <span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);font-size:11px;font-weight:700;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.3);z-index:1;">$(if($pct -ge 8){"$pct%"})</span>
+                    <span style="position:absolute;right:8px;top:50%;transform:translateY(-50%);font-size:11px;font-weight:600;color:#605e5c;z-index:1;">$(if($pct -lt 8){"$pct%"})</span>
+                </div>
+                <div style="text-align:right;font-weight:700;color:#323130;font-size:13px;">`$$([math]::Round($pub.Value, 0).ToString('N0'))</div>
+                <div style="text-align:center;font-size:12px;color:#605e5c;">$currency</div>
+                <div style="text-align:right;font-weight:600;color:$growthColor;font-size:12px;">$growthIcon ${growthVal}%</div>
+            </div>
+"@
+        }
+
+        # Heatmap
+        $globalMaxM = [double]0
+        foreach ($pub in $mpCost.TopPublishers) {
+            foreach ($m in $months) {
+                if ($mpCost.MonthlyByPub.ContainsKey($pub.Key) -and $mpCost.MonthlyByPub[$pub.Key].ContainsKey($m)) {
+                    $v = [double]$mpCost.MonthlyByPub[$pub.Key][$m]
+                    if ($v -gt $globalMaxM) { $globalMaxM = $v }
+                }
+            }
+        }
+        $heatHeaderCells = ($monthLabels | ForEach-Object { "<th style='text-align:center;font-size:11px;padding:8px 6px;color:#605e5c;font-weight:600;'>$_</th>" }) -join ""
+        $heatRows = ""; $rank2 = 0
+        foreach ($pub in $mpCost.TopPublishers) {
+            $rank2++
+            $pubSafe = ConvertTo-SafeHtml $pub.Key
+            $barColor = switch ($rank2) { 1 {"#5c2d91"} 2 {"#0078d4"} 3 {"#ca5010"} 4 {"#107c10"} 5 {"#008272"} 6 {"#d13438"} 7 {"#00b7c3"} 8 {"#8764b8"} 9 {"#498205"} 10 {"#da3b01"} default {"#8a8886"} }
+            $cells = ""; $prevVal = $null
+            foreach ($m in $months) {
+                $val = [double]0
+                if ($mpCost.MonthlyByPub.ContainsKey($pub.Key) -and $mpCost.MonthlyByPub[$pub.Key].ContainsKey($m)) { $val = [math]::Round([double]$mpCost.MonthlyByPub[$pub.Key][$m], 0) }
+                $intensity = if ($globalMaxM -gt 0) { [math]::Round(($val / $globalMaxM) * 0.85 + 0.05, 2) } else { 0.05 }
+                $intensity = [math]::Min($intensity, 0.9)
+                $changeIndicator = ""
+                if ($null -ne $prevVal -and $prevVal -gt 0 -and $val -gt 0) {
+                    $pctChange = [math]::Round((($val - $prevVal) / $prevVal) * 100, 0)
+                    if ($pctChange -gt 15) { $changeIndicator = "<div style='font-size:9px;color:#d13438;font-weight:700;'>&#9650;${pctChange}%</div>" }
+                    elseif ($pctChange -lt -15) { $changeIndicator = "<div style='font-size:9px;color:#107c10;font-weight:700;'>&#9660;${pctChange}%</div>" }
+                }
+                $displayVal = if ($val -ge 1000) { "`$$([math]::Round($val/1000,1))k" } elseif ($val -gt 0) { "`$$val" } else { "-" }
+                $cells += "<td style='text-align:center;padding:6px 4px;background:rgba($(if($rank2 -le 3){"91,45,145"}else{"50,50,50"}),$intensity);border-radius:3px;'><div style='font-size:12px;font-weight:600;color:$(if($intensity -gt 0.5){"#fff"}else{"#323130"});'>$displayVal</div>$changeIndicator</td>"
+                $prevVal = $val
+            }
+            $growthVal = if ($mpCost.Growth.ContainsKey($pub.Key)) { $mpCost.Growth[$pub.Key] } else { 0 }
+            $growthColor = if ($growthVal -gt 20) { "#d13438" } elseif ($growthVal -gt 0) { "#ca5010" } elseif ($growthVal -lt 0) { "#107c10" } else { "#605e5c" }
+            $growthIcon = if ($growthVal -gt 0) { "&#9650;" } elseif ($growthVal -lt 0) { "&#9660;" } else { "&#9644;" }
+            $heatRows += "<tr><td style='font-weight:600;font-size:12px;padding:8px 10px;white-space:nowrap;border-right:2px solid #e8e8e8;'><span style='display:inline-block;width:10px;height:10px;border-radius:2px;background:$barColor;margin-right:6px;vertical-align:middle;'></span>$pubSafe</td>$cells<td style='text-align:center;font-weight:700;color:$growthColor;font-size:12px;padding:8px;border-left:2px solid #e8e8e8;'>$growthIcon ${growthVal}%</td></tr>"
+        }
+
+        # Growth leader cards
+        $mpGrowthCards = ""
+        $sortedGrowth = $mpCost.TopPublishers | Sort-Object { if ($mpCost.Growth.ContainsKey($_.Key)) { [math]::Abs([double]$mpCost.Growth[$_.Key]) } else { 0 } } -Descending | Select-Object -First 5
+        foreach ($pub in $sortedGrowth) {
+            $pubSafe = ConvertTo-SafeHtml $pub.Key
+            $growthVal = if ($mpCost.Growth.ContainsKey($pub.Key)) { $mpCost.Growth[$pub.Key] } else { 0 }
+            if ($growthVal -eq 0) { continue }
+            $isUp = $growthVal -gt 0
+            $cardBg = if ($isUp) { "linear-gradient(135deg,#fff5f5,#ffe0e0)" } else { "linear-gradient(135deg,#f0fff4,#d3f9d8)" }
+            $cardBorder = if ($isUp) { "#ffc9c9" } else { "#b2f2bb" }
+            $iconColor = if ($isUp) { "#d13438" } else { "#107c10" }
+            $arrow = if ($isUp) { "&#9650;" } else { "&#9660;" }
+            $mpGrowthCards += @"
+            <div style="flex:1;min-width:140px;max-width:200px;background:$cardBg;border:1px solid $cardBorder;border-radius:10px;padding:14px 16px;text-align:center;">
+                <div style="font-size:11px;color:#605e5c;font-weight:600;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="$pubSafe">$pubSafe</div>
+                <div style="font-size:1.8em;font-weight:800;color:$iconColor;line-height:1.1;">$arrow ${growthVal}%</div>
+                <div style="font-size:10px;color:#8a8886;margin-top:4px;">6-month trend</div>
+            </div>
+"@
+        }
+
+        # Monthly totals for sparkline chart
+        $monthlyTotals = @($months | ForEach-Object { $m = $_; $total = 0; foreach ($pub in $mpCost.TopPublishers) { if ($mpCost.MonthlyByPub.ContainsKey($pub.Key) -and $mpCost.MonthlyByPub[$pub.Key].ContainsKey($m)) { $total += [double]$mpCost.MonthlyByPub[$pub.Key][$m] } }; [math]::Round($total, 0) })
+
+        [void]$mpCostTrendHtml.AppendLine(@"
+        <div style="margin-bottom:32px;border:1px solid var(--border);border-radius:12px;padding:24px;background:var(--surface);box-shadow:var(--shadow-sm);">
+            <h3 style="font-size:16px;font-weight:700;color:var(--text);margin-bottom:20px;padding-bottom:12px;border-bottom:2px solid #5c2d91;">&#128176; Marketplace Cost — $safeName</h3>
+
+            <!-- KPI Cards -->
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px;">
+                <div style="background:linear-gradient(135deg,#5c2d91,#3b1f6e);border-radius:10px;padding:20px;text-align:center;box-shadow:0 4px 16px rgba(91,45,145,.2);">
+                    <div style="font-size:28px;font-weight:800;color:#fff;">`$$([math]::Round($mpCost.TotalCost, 0).ToString('N0'))</div>
+                    <div style="font-size:11px;color:rgba(255,255,255,.8);font-weight:600;">Total Marketplace (6 months) · $currency</div>
+                </div>
+                <div style="background:linear-gradient(135deg,#f5f5f5,#e8e8e8);border:1px solid #e0e0e0;border-radius:10px;padding:20px;text-align:center;">
+                    <div style="font-size:28px;font-weight:800;color:#323130;">`$$($avgMonthly.ToString('N0'))</div>
+                    <div style="font-size:11px;color:#605e5c;font-weight:600;">Average Monthly</div>
+                </div>
+                <div style="background:linear-gradient(135deg,#f5f5f5,#e8e8e8);border:1px solid #e0e0e0;border-radius:10px;padding:20px;text-align:center;">
+                    <div style="font-size:28px;font-weight:800;color:#5c2d91;">$($mpCost.TopPublishers.Count)</div>
+                    <div style="font-size:11px;color:#605e5c;font-weight:600;">Active Publishers</div>
+                </div>
+                <div style="background:linear-gradient(135deg,$(if($topGrowthVal -gt 20){"#fff5f5,#ffe8e8"}elseif($topGrowthVal -gt 0){"#fff8f0,#fff0e0"}else{"#f0fff4,#e0f5e8"}));border:1px solid $(if($topGrowthVal -gt 20){"#ffc9c9"}elseif($topGrowthVal -gt 0){"#ffe0b2"}else{"#b2f2bb"});border-radius:10px;padding:20px;text-align:center;">
+                    <div style="font-size:28px;font-weight:800;color:$topGrowthColor;">$topGrowthIcon ${topGrowthVal}%</div>
+                    <div style="font-size:10px;color:#605e5c;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="$(ConvertTo-SafeHtml $topGrower)">&#128293; $(ConvertTo-SafeHtml $topGrower)</div>
+                </div>
+            </div>
+
+            <!-- Growth Leaders -->
+            $(if($mpGrowthCards) {
+            @"
+            <div style="margin-bottom:24px;">
+                <h4 style="font-size:12px;font-weight:700;color:#605e5c;text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;">&#128200; Growth Leaders (6-month trend)</h4>
+                <div style="display:flex;gap:12px;flex-wrap:wrap;">$mpGrowthCards</div>
+            </div>
+"@
+            })
+
+            <!-- Cost Distribution: Horizontal Bars -->
+            <div style="margin-bottom:24px;">
+                <h4 style="font-size:12px;font-weight:700;color:#605e5c;text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;">&#128202; Cost Distribution by Publisher</h4>
+                <div style="background:#fafafa;border:1px solid #edebe9;border-radius:8px;overflow:hidden;">
+                    <div style="display:grid;grid-template-columns:200px 1fr 90px 70px 80px;align-items:center;gap:12px;padding:8px 12px;background:#f3f2f1;font-size:11px;font-weight:700;color:#605e5c;text-transform:uppercase;letter-spacing:.3px;">
+                        <div>Publisher</div><div>Distribution</div><div style="text-align:right">Cost</div><div style="text-align:center">Currency</div><div style="text-align:right">Trend</div>
+                    </div>
+                    $mpBarRows
+                </div>
+            </div>
+
+            <!-- Monthly Heatmap -->
+            <div>
+                <h4 style="font-size:12px;font-weight:700;color:#605e5c;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">&#128197; Monthly Cost Trend — Heatmap</h4>
+                <p style="font-size:11px;color:#8a8886;margin-bottom:12px;line-height:1.5;">Publishers sorted by <strong style="color:#605e5c;">total accumulated cost</strong> over the 6-month period (highest to lowest).</p>
+                <div style="overflow-x:auto;border:1px solid #edebe9;border-radius:8px;">
+                    <table style="width:100%;border-collapse:separate;border-spacing:3px;font-size:12px;">
+                        <thead><tr><th style="text-align:left;padding:8px 10px;font-size:11px;color:#605e5c;font-weight:700;min-width:160px;border-right:2px solid #e8e8e8;">Publisher</th>$heatHeaderCells<th style="text-align:center;padding:8px 6px;font-size:11px;color:#605e5c;font-weight:700;border-left:2px solid #e8e8e8;min-width:70px;">Trend</th></tr></thead>
+                        <tbody>$heatRows</tbody>
+                    </table>
+                </div>
+                <div style="margin-top:8px;font-size:10px;color:#8a8886;display:flex;gap:16px;align-items:center;">
+                    <span>&#9632; Color intensity = relative cost</span>
+                    <span style="color:#d13438;">&#9650; = month-over-month increase &gt;15%</span>
+                    <span style="color:#107c10;">&#9660; = month-over-month decrease &gt;15%</span>
+                </div>
+            </div>
+        </div>
+"@)
+    }
+    $mpCostTrendHtmlStr = $mpCostTrendHtml.ToString()
+
     # Subscription Hygiene findings
     $hygieneFindings = @($allFindings | Where-Object { $_.Category -match 'Hygiene' })
     $hygieneCritical = @($hygieneFindings | Where-Object { $_.Severity -eq 'Critical' }).Count
@@ -11530,18 +11796,8 @@ $(if ($riTotal -gt 0) { @"
                 </table>
             </div>
 
-            $(if ($script:MarketplaceCosts -and $script:MarketplaceCosts.Count -gt 0) {
-            @"
-            <!-- Marketplace Cost Breakdown -->
-            <h4 style="font-size:12px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;">&#128176; Marketplace Cost (Month-to-Date)</h4>
-            <div class="table-container" style="margin-bottom:24px;">
-                <table>
-                    <thead><tr><th>Publisher</th><th style="text-align:right">MTD Cost</th><th>Currency</th><th>Subscription</th></tr></thead>
-                    <tbody>$mpCostRows</tbody>
-                </table>
-            </div>
-"@
-            })
+            <!-- Marketplace 6-Month Cost Trend (same style as main Cost section) -->
+            $mpCostTrendHtmlStr
 
             <!-- Marketplace Findings -->
             <h4 style="font-size:12px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;">&#128270; Marketplace Findings</h4>
