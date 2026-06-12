@@ -8723,6 +8723,49 @@ function Generate-HTMLReport {
     }
     $cosmosRows = $cosmosRowsBuilder.ToString()
 
+    # Marketplace deployed products — inventory + findings
+    $mpFindings = @($allFindings | Where-Object { $_.Category -match 'Marketplace' })
+    $mpCritical = @($mpFindings | Where-Object { $_.Severity -eq 'Critical' }).Count
+    $mpHigh     = @($mpFindings | Where-Object { $_.Severity -eq 'High' }).Count
+    $mpMedium   = @($mpFindings | Where-Object { $_.Severity -eq 'Medium' }).Count
+    $mpLow      = @($mpFindings | Where-Object { $_.Severity -eq 'Low' }).Count
+    $mpTotal    = $mpFindings.Count
+    $mpInvCount = if ($script:MarketplaceInventory) { $script:MarketplaceInventory.Count } else { 0 }
+    $mpFindingsRowsBuilder = [System.Text.StringBuilder]::new()
+    foreach ($f in ($mpFindings | Sort-Object @{Expression={ switch($_.Severity) { 'Critical'{0} 'High'{1} 'Medium'{2} default{3} } }})) {
+        $sevClass = $f.Severity.ToLower()
+        $catIcon = switch -Regex ($f.Category) {
+            'Unhealthy'   { "⚠️" }
+            'Delisted'    { "🚫" }
+            'Unknown'     { "❓" }
+            'Outdated'    { "📦" }
+            'Spend|Cost'  { "💰" }
+            'Lock'        { "🔒" }
+            default       { "🛒" }
+        }
+        [void]$mpFindingsRowsBuilder.Append("<tr class=`"finding-row`" data-severity=`"$($f.Severity)`" data-category=`"$(ConvertTo-SafeHtml $f.Category)`"><td><span class=`"severity-badge $sevClass`">$($f.Severity)</span></td><td>$catIcon $(ConvertTo-SafeHtml $f.Category)</td><td><strong>$(ConvertTo-SafeHtml $f.ResourceName)</strong><br><small style=`"color:var(--text-dim)`">$(ConvertTo-SafeHtml $f.ResourceType)</small><br><small style=`"color:#0078d4;font-weight:600`">&#128203; $(ConvertTo-SafeHtml $f.Subscription)</small></td><td>$(ConvertTo-SafeHtml $f.FindingName)</td><td>$(ConvertTo-SafeHtml $f.Recommendation)</td></tr>")
+    }
+    $mpFindingsRows = $mpFindingsRowsBuilder.ToString()
+
+    # Marketplace inventory table rows
+    $mpInventoryRowsBuilder = [System.Text.StringBuilder]::new()
+    if ($script:MarketplaceInventory) {
+        foreach ($m in ($script:MarketplaceInventory | Sort-Object Publisher, Product)) {
+            $stateClass = if ($m.ProvisioningState -in @('Succeeded','Active','Running','Ready','Subscribed')) { 'color:#107c10;font-weight:600' } else { 'color:#d13438;font-weight:600' }
+            [void]$mpInventoryRowsBuilder.Append("<tr><td style='font-weight:600'>$(ConvertTo-SafeHtml $m.Name)</td><td>$(ConvertTo-SafeHtml $m.Publisher)</td><td>$(ConvertTo-SafeHtml $m.Product)</td><td>$(ConvertTo-SafeHtml $m.Plan)</td><td>$(ConvertTo-SafeHtml $m.Version)</td><td style='$stateClass'>$(ConvertTo-SafeHtml $m.ProvisioningState)</td><td style='font-size:.82em;color:var(--text-dim)'>$(ConvertTo-SafeHtml $m.Subscription)</td></tr>")
+        }
+    }
+    $mpInventoryRows = $mpInventoryRowsBuilder.ToString()
+
+    # Marketplace cost table rows
+    $mpCostRowsBuilder = [System.Text.StringBuilder]::new()
+    if ($script:MarketplaceCosts) {
+        foreach ($c in ($script:MarketplaceCosts | Sort-Object MtdCost -Descending)) {
+            [void]$mpCostRowsBuilder.Append("<tr><td style='font-weight:600'>$(ConvertTo-SafeHtml $c.Publisher)</td><td style='text-align:right;font-weight:700;color:#0078d4'>`$$($c.MtdCost)</td><td>$(ConvertTo-SafeHtml $c.Currency)</td><td style='font-size:.82em;color:var(--text-dim)'>$(ConvertTo-SafeHtml $c.Subscription)</td></tr>")
+        }
+    }
+    $mpCostRows = $mpCostRowsBuilder.ToString()
+
     # Subscription Hygiene findings
     $hygieneFindings = @($allFindings | Where-Object { $_.Category -match 'Hygiene' })
     $hygieneCritical = @($hygieneFindings | Where-Object { $_.Severity -eq 'Critical' }).Count
@@ -9919,6 +9962,8 @@ function Generate-HTMLReport {
         <div class="sidebar-section-title">Resources</div>
         <div class="sidebar-group">
             <div class="sidebar-group-items">
+                <a href="#" onclick="navTo('blade-marketplace',this,event)">
+                    <span class="sidebar-icon"><svg viewBox="0 0 16 16" fill="none"><path d="M2 3h12v2l-1 1H3L2 5V3z" fill="#0078d4"/><path d="M3 6v7h10V6" stroke="#0078d4" stroke-width="1.1" fill="none"/><path d="M6 9h4v4H6z" fill="#0078d4" opacity=".5"/></svg></span> Marketplace</a>
                 <a href="#" onclick="navTo('blade-inventory',this,event)">
                     <span class="sidebar-icon"><svg viewBox="0 0 16 16" fill="none"><path d="M3 2h10a1 1 0 011 1v10a1 1 0 01-1 1H3a1 1 0 01-1-1V3a1 1 0 011-1zm1 3v2h8V5H4zm0 4v2h8V9H4z" fill="#0078d4"/></svg></span> Inventory</a>
             </div>
@@ -11437,6 +11482,86 @@ $(if ($riTotal -gt 0) { @"
     </div>
 
     </div><!-- /blade-databases -->
+
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <!-- BLADE: MARKETPLACE DEPLOYED PRODUCTS                                  -->
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <div class="blade" id="blade-marketplace" style="display:none">
+    <div class="section" id="section-marketplace">
+        <div class="section-header" onclick="toggleSection(this)">
+            <h2>&#128722; Azure Marketplace Products</h2>
+            <span class="toggle">&#9660;</span>
+        </div>
+        <div class="section-content">
+            <div style="background:linear-gradient(135deg,#7b2d8e 0%,#5c2d91 40%,#3b1f6e 100%);border-radius:12px;padding:28px 32px;margin-bottom:24px;box-shadow:0 4px 24px rgba(91,45,145,0.25);position:relative;overflow:hidden;">
+                <div style="position:absolute;top:0;left:0;right:0;bottom:0;background:url(&quot;data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.03'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E&quot;);pointer-events:none;"></div>
+                <div style="display:flex;gap:30px;flex-wrap:wrap;align-items:center;position:relative;z-index:1;">
+                    <div style="flex:1;min-width:200px;text-align:center;">
+                        <div style="font-weight:700;color:#ffffff;font-size:1.2em;margin-bottom:6px;">Third-Party &amp; Marketplace Deployments</div>
+                        <div style="font-size:.85em;color:rgba(255,255,255,0.8);line-height:1.5;">Inventory, health status, publisher verification, version analysis, and cost tracking for Azure Marketplace products.</div>
+                    </div>
+                    <div style="display:flex;gap:12px;flex-wrap:wrap;justify-content:center;">
+                        <div style="text-align:center;min-width:72px;background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.2);border-radius:10px;padding:14px 18px;backdrop-filter:blur(10px);">
+                            <div style="font-size:1.9em;font-weight:700;color:#69db7c;line-height:1.1;">$mpInvCount</div>
+                            <div style="font-size:.68em;color:rgba(255,255,255,0.8);font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-top:4px;">Products</div>
+                        </div>
+                        <div style="text-align:center;min-width:72px;background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.2);border-radius:10px;padding:14px 18px;backdrop-filter:blur(10px);">
+                            <div style="font-size:1.9em;font-weight:700;color:#ff6b6b;line-height:1.1;">$mpHigh</div>
+                            <div style="font-size:.68em;color:rgba(255,255,255,0.8);font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-top:4px;">High</div>
+                        </div>
+                        <div style="text-align:center;min-width:72px;background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.2);border-radius:10px;padding:14px 18px;backdrop-filter:blur(10px);">
+                            <div style="font-size:1.9em;font-weight:700;color:rgba(255,255,255,0.7);line-height:1.1;">$mpMedium</div>
+                            <div style="font-size:.68em;color:rgba(255,255,255,0.8);font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-top:4px;">Medium</div>
+                        </div>
+                        <div style="text-align:center;min-width:72px;background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.2);border-radius:10px;padding:14px 18px;backdrop-filter:blur(10px);">
+                            <div style="font-size:1.9em;font-weight:700;color:#ffffff;line-height:1.1;">$mpTotal</div>
+                            <div style="font-size:.68em;color:rgba(255,255,255,0.8);font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-top:4px;">Findings</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Marketplace Inventory Table -->
+            <h4 style="font-size:12px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;">&#128230; Deployed Products Inventory</h4>
+            <div class="table-container" style="margin-bottom:24px;">
+                <table>
+                    <thead><tr><th>Name</th><th>Publisher</th><th>Product</th><th>Plan</th><th>Version</th><th>State</th><th>Subscription</th></tr></thead>
+                    <tbody>$mpInventoryRows</tbody>
+                </table>
+            </div>
+
+            $(if ($script:MarketplaceCosts -and $script:MarketplaceCosts.Count -gt 0) {
+            @"
+            <!-- Marketplace Cost Breakdown -->
+            <h4 style="font-size:12px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;">&#128176; Marketplace Cost (Month-to-Date)</h4>
+            <div class="table-container" style="margin-bottom:24px;">
+                <table>
+                    <thead><tr><th>Publisher</th><th style="text-align:right">MTD Cost</th><th>Currency</th><th>Subscription</th></tr></thead>
+                    <tbody>$mpCostRows</tbody>
+                </table>
+            </div>
+"@
+            })
+
+            <!-- Marketplace Findings -->
+            <h4 style="font-size:12px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;">&#128270; Marketplace Findings</h4>
+            <div class="filters">
+                <strong style="font-size:.85em;color:var(--text-dim);">Severity:</strong>
+                <button class="filter-btn active" onclick="filterFindings('all', this)">All</button>
+                <button class="filter-btn sev-high" onclick="filterFindings('High', this)">High</button>
+                <button class="filter-btn sev-medium" onclick="filterFindings('Medium', this)">Medium</button>
+                <button class="filter-btn sev-low" onclick="filterFindings('Low', this)">Low</button>
+                <input type="text" class="search-box" placeholder="Search marketplace..." oninput="searchFindings(this.value, this)">
+            </div>
+            <div class="table-container">
+                <table id="marketplaceTable">
+                    <thead><tr><th>Severity</th><th>Category</th><th>Resource</th><th>Finding</th><th>Recommendation</th></tr></thead>
+                    <tbody>$mpFindingsRows</tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    </div><!-- /blade-marketplace -->
 
     <!-- ═══════════════════════════════════════════════════════════════════════ -->
     <!-- BLADE 11: INVENTORY                                                   -->
