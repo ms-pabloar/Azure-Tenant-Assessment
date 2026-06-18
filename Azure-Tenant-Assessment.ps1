@@ -7615,6 +7615,10 @@ resources
 function Generate-HTMLReport {
     Write-Status "Generating interactive HTML report..." "SECTION"
 
+    # Ensure critical arrays are never null (handles 0-subscription scenario)
+    if (-not $script:Findings)  { $script:Findings  = @() }
+    if (-not $script:Resources) { $script:Resources = @() }
+
     $duration = (Get-Date) - $script:StartTime
 
     # Calculate pillar statistics
