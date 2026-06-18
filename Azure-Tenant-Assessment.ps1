@@ -14595,6 +14595,7 @@ function Main {
     $subIndex = 0
     $subTotal = $script:Subscriptions.Count
     $consecutiveNetworkFailures = 0
+    $skippedSubscriptions = [System.Collections.Generic.List[string]]::new()
     foreach ($sub in $script:Subscriptions) {
         $subIndex++
         $elapsed = [math]::Round(((Get-Date) - $script:StartTime).TotalMinutes, 1)
@@ -14640,6 +14641,7 @@ function Main {
                 }
             } else {
                 # Access/permission error — skip this subscription but don't count as network failure
+                $skippedSubscriptions.Add($sub.Name)
                 Write-Status "  Skipping subscription $($sub.Name) (access denied or invalid)." "WARN"
                 $consecutiveNetworkFailures = 0
             }
@@ -14738,7 +14740,14 @@ function Main {
         "$([math]::Round($duration.TotalMinutes, 1)) minutes"
     }
     Write-Status "Total duration: $durationStr" "OK"
-    Write-Status "Subscriptions processed: $subTotal" "OK"
+    $analyzedCount = $subTotal - $skippedSubscriptions.Count
+    Write-Status "Subscriptions analyzed: $analyzedCount/$subTotal" $(if($skippedSubscriptions.Count -gt 0){"WARN"}else{"OK"})
+    if ($skippedSubscriptions.Count -gt 0) {
+        Write-Status "  Skipped (no access): $($skippedSubscriptions.Count)" "WARN"
+        foreach ($skipped in $skippedSubscriptions) {
+            Write-Host "    • $skipped" -ForegroundColor DarkYellow
+        }
+    }
     Write-Status "Analysis steps: $($okSteps.Count)/$totalSteps succeeded" $(if($errorCount -eq 0){"OK"}else{"WARN"})
     Write-Status "Resources analyzed: $($script:Summary.TotalResources)" "OK"
     Write-Status "Total findings: $($script:Findings.Count)" "OK"
