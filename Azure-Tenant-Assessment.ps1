@@ -14605,6 +14605,7 @@ function Main {
 
         # Switch subscription context with retry logic for transient network failures
         $switchSuccess = $false
+        $isNetworkError = $false
         for ($retryAttempt = 1; $retryAttempt -le 3; $retryAttempt++) {
             try {
                 Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null
@@ -14614,24 +14615,33 @@ function Main {
             } catch {
                 $errMsg = $_.Exception.Message
                 if ($errMsg -match 'No such host is known|name.resolution|DNS|network.unreachable|timeout' -and $retryAttempt -lt 3) {
+                    $isNetworkError = $true
                     Write-Status "  Network error switching to $($sub.Name) (attempt $retryAttempt/3) — retrying in $($retryAttempt * 15)s..." "WARN"
                     Start-Sleep -Seconds ($retryAttempt * 15)
                 } else {
+                    # Classify the error type
+                    $isNetworkError = $errMsg -match 'No such host is known|name.resolution|DNS|network.unreachable|timeout'
                     Write-Status "Could not switch to subscription $($sub.Name): $errMsg" "ERROR"
                     break
                 }
             }
         }
         if (-not $switchSuccess) {
-            $consecutiveNetworkFailures++
-            if ($consecutiveNetworkFailures -ge 3) {
-                Write-Host ""
-                Write-Status "ABORTING: $consecutiveNetworkFailures consecutive network failures detected." "ERROR"
-                Write-Status "Cloud Shell has lost connectivity to Azure (DNS resolution failed for management.azure.com)." "ERROR"
-                Write-Status "The report will be generated with data collected so far ($($subIndex - $consecutiveNetworkFailures)/$subTotal subscriptions)." "WARN"
-                Write-Status "To complete the assessment: restart Cloud Shell and re-run the script." "INFO"
-                Write-Host ""
-                break
+            if ($isNetworkError) {
+                $consecutiveNetworkFailures++
+                if ($consecutiveNetworkFailures -ge 3) {
+                    Write-Host ""
+                    Write-Status "ABORTING: $consecutiveNetworkFailures consecutive network failures detected." "ERROR"
+                    Write-Status "Cloud Shell has lost connectivity to Azure (DNS resolution failed for management.azure.com)." "ERROR"
+                    Write-Status "The report will be generated with data collected so far ($($subIndex - $consecutiveNetworkFailures)/$subTotal subscriptions)." "WARN"
+                    Write-Status "To complete the assessment: restart Cloud Shell and re-run the script." "INFO"
+                    Write-Host ""
+                    break
+                }
+            } else {
+                # Access/permission error — skip this subscription but don't count as network failure
+                Write-Status "  Skipping subscription $($sub.Name) (access denied or invalid)." "WARN"
+                $consecutiveNetworkFailures = 0
             }
             continue
         }
