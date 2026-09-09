@@ -17,6 +17,7 @@ It evaluates **every subscription** the authenticated identity has access to, an
 - **30+ specialized analysis functions** covering networking, compute, databases, storage, identity, containers, monitoring, BCDR, cost, modernization, and more
 - **Real Azure Monitor metrics** (CPU, network, DTU, IOPS, requests) to identify underutilized and idle resources
 - **6-month cost trend analysis** per subscription, broken down by service, with monthly sparklines
+- **Reservation and Savings Plan purchase analysis** using Azure-calculated 30/60-day usage, hourly commitments, coverage, utilization, and projected savings
 - **Network topology visualization** — interactive SVG diagram showing VNets, subnets, NSGs, peering connections, public IPs, NAT Gateways, and internet egress paths
 - **Zero Trust maturity assessment** across Network, Compute, and Platform layers
 - **ALZ/CAF readiness evaluation** including management group hierarchy, policy enforcement, and naming conventions
@@ -58,7 +59,8 @@ The script requires **read-only** access. No write permissions are needed.
 | Permission | Scope | Required? | Purpose |
 |------------|-------|-----------|---------|
 | **Reader** | Each subscription | **Yes** | Resource enumeration, configuration analysis, network topology |
-| **Cost Management Reader** | Each subscription | Optional | 6-month cost trend analysis; gracefully skipped if unavailable |
+| **Cost Management Reader** | Each subscription | Optional | Cost trends and Savings Plan recommendations; gracefully skipped if unavailable |
+| **Reservation Reader** | Billing scope | Optional | Existing reservation inventory, utilization, and purchase recommendations |
 | **Key Vault Secrets List** | Key Vaults (data-plane) | Optional | Expiring secrets/certificates detection; skip with `-SkipKeyVaultDataPlane` |
 | **Management Group Reader** | Tenant Root Group | Optional | ALZ/CAF readiness analysis (MG hierarchy, tenant-level policies) |
 | **Microsoft Graph** | Tenant | Optional | Conditional Access and PIM verification; auto-connects if `Microsoft.Graph.Authentication` module is installed |
@@ -107,6 +109,9 @@ Connect-AzAccount
 
 # Custom mandatory tags for compliance analysis
 ./Azure-Tenant-Assessment.ps1 -SkipLogin -MandatoryTags @('Environment','Owner','CostCenter','Project')
+
+# Use 60 days of eligible usage for commitment purchase recommendations
+./Azure-Tenant-Assessment.ps1 -CommitmentLookbackDays 60
 ```
 
 ### All Parameters
@@ -120,6 +125,7 @@ Connect-AzAccount
 | `-SkipKeyVaultDataPlane` | switch | false | Skip Key Vault secret/certificate enumeration |
 | `-SkipBackupDetails` | switch | false | Skip detailed backup item enumeration |
 | `-MetricDays` | int | 7 | Metrics analysis window in days (7 or 14) |
+| `-CommitmentLookbackDays` | int | 30 | Azure commitment recommendation lookback (`30` or `60` days) |
 | `-CpuLowPercent` | int | 10 | CPU % threshold for underutilized VM detection |
 | `-CpuIdlePercent` | int | 5 | CPU % threshold for idle VM detection |
 | `-NetLowMB` | int | 5 | Network throughput (MB/h) threshold |
@@ -194,6 +200,18 @@ Cost data is collected via the Azure Cost Management REST API (`Microsoft.CostMa
 - **Grouped by service name** (Virtual Machines, Storage, Networking, etc.)
 - **Automatic throttling recovery** — retries HTTP 429 responses up to 6 times, honoring Azure retry headers with exponential backoff as fallback
 - Requires `Cost Management Reader` role (optional; gracefully skipped)
+
+### Reservation and Savings Plan Recommendations
+
+Purchase recommendations come from Azure's billing recommendation engines rather than static public prices:
+
+- **Reservations** use `Microsoft.Consumption/reservationRecommendations` to compare actual PAYG cost against 1-year and 3-year reservation scenarios by SKU, family, region, quantity, and scope.
+- **Savings Plans** use `Microsoft.CostManagement/benefitRecommendations` with hourly eligible charges, commitment amount, coverage, projected utilization, wastage, and 1-year/3-year terms.
+- Existing eligible Reservations and Savings Plans are accounted for by Azure's recommendation model.
+- A recommendation must meet conservative savings and utilization thresholds. Matching underutilized VMs are marked `Review first` so rightsizing happens before commitment purchase.
+- Only one overlapping option per subscription is marked `Preferred`; other valid options remain visible as alternatives.
+
+These recommendations support financial review and do not purchase or modify any Azure benefit.
 
 ### Microsoft Graph (Optional)
 If the `Microsoft.Graph.Authentication` module is installed, the script auto-connects to verify:

@@ -18,7 +18,7 @@
     - Complete inventory of resources, configurations, and detected issues
 .NOTES
     Author: Azure Assessment Tool
-    Version: 5.0
+    Version: 5.6
     Requiere: Az PowerShell Modules (Az.Accounts, Az.Compute, Az.Network, Az.Sql,
               Az.Storage, Az.KeyVault, Az.Monitor, Az.Security, Az.Aks,
               Az.OperationalInsights, Az.RecoveryServices, Az.ResourceGraph)
@@ -45,6 +45,7 @@
     ./Azure-Tenant-Assessment.ps1 -SkipMetrics                    # Skip underutilized analysis (fastest)
     ./Azure-Tenant-Assessment.ps1 -MetricDays 7                   # 7-day window instead of 14
     ./Azure-Tenant-Assessment.ps1 -CpuLowPercent 15 -AppRequestLowPerHour 20
+    ./Azure-Tenant-Assessment.ps1 -CommitmentLookbackDays 60      # Use 60 days for RI/Savings Plan analysis
     ./Azure-Tenant-Assessment.ps1 -IncludeALZ                     # (Backward compat — ALZ runs by default now)
     ./Azure-Tenant-Assessment.ps1 -IncludeALZ -SkipLogin          # (Backward compat — ALZ runs by default now)
     ./Azure-Tenant-Assessment.ps1 -RequireValidSignature          # Block unless Authenticode status is Valid
@@ -93,6 +94,10 @@ param(
 
     [Parameter(Mandatory=$false)]
     [int]$MetricDays = 7,
+
+    [Parameter(Mandatory=$false, HelpMessage="Usage lookback for Azure Reservation and Savings Plan recommendations.")]
+    [ValidateSet(30, 60)]
+    [int]$CommitmentLookbackDays = 30,
 
     [Parameter(Mandatory=$false, HelpMessage="Include Azure Landing Zone (ALZ/CAF) readiness checks. Requires Management Group Reader + optional Microsoft Graph permissions.")]
     [switch]$IncludeALZ,
@@ -194,6 +199,7 @@ function Clear-SubscriptionCaches {
 }
 $script:PreFlightResults = [System.Collections.Generic.List[PSCustomObject]]::new()  # Permission check results
 $script:ReservationData = [System.Collections.Generic.List[PSCustomObject]]::new()   # Reservation & Savings Plan inventory
+$script:CommitmentRecommendations = [System.Collections.Generic.List[PSCustomObject]]::new() # Advisor-backed purchase candidates
 
 # ============================================================================
 # CLOUD SHELL KEEP-ALIVE
@@ -347,6 +353,338 @@ function Add-Finding {
         Source         = if ($Source) { $Source } else { 'Custom Analysis' }
     })
     $script:Summary[$Severity]++
+}
+
+function Get-FirstPropertyValue {
+    param([object]$InputObject, [string[]]$Names)
+
+    if ($null -eq $InputObject) { return $null }
+    foreach ($name in $Names) {
+        if ($InputObject -is [System.Collections.IDictionary] -and $InputObject.Contains($name)) {
+            $value = $InputObject[$name]
+        } else {
+            $property = $InputObject.PSObject.Properties[$name]
+            $value = if ($property) { $property.Value } else { $null }
+        }
+        if ($null -ne $value -and "$value" -ne '') { return $value }
+    }
+    return $null
+}
+
+function ConvertTo-CommitmentRecommendation {
+    param([object]$AdvisorRecommendation, [string]$SubId, [string]$SubName)
+
+    $properties = $AdvisorRecommendation.properties
+    $extended = $properties.extendedProperties
+    $problem = [string]$properties.shortDescription.problem
+    $solution = [string]$properties.shortDescription.solution
+    $recommendationType = Get-FirstPropertyValue $extended @('recommendationType', 'benefitType', 'type', 'subType')
+    $classificationText = "$recommendationType $problem $solution"
+    $commitmentType = if ($classificationText -match '(?i)savings?\s*plan') {
+        'SavingsPlan'
+    } elseif ($classificationText -match '(?i)reserv(ed|ation)|reserved\s+(instance|vm)') {
+        'Reservation'
+    } else {
+        return $null
+    }
+
+    $resourceId = Get-FirstPropertyValue $properties.resourceMetadata @('resourceId')
+    if (-not $resourceId) { $resourceId = $AdvisorRecommendation.id }
+    $resourceName = if ($resourceId) { $resourceId.ToString().Split('/')[-1] } else { 'Subscription commitment' }
+    $underutilizedVM = $script:UnderutilizedResources | Where-Object {
+        $_.Subscription -eq $SubName -and $_.ResourceName -eq $resourceName -and $_.ResourceType -match 'Virtual Machine'
+    } | Select-Object -First 1
+    $annualSavings = Get-FirstPropertyValue $extended @('annualSavingsAmount', 'annualSavings')
+    $savingsAmount = if ($null -ne $annualSavings) { $annualSavings } else { Get-FirstPropertyValue $extended @('savingsAmount') }
+
+    return [PSCustomObject]@{
+        Type              = $commitmentType
+        SubscriptionId    = $SubId
+        Subscription      = $SubName
+        ResourceId        = $resourceId
+        ResourceName      = $resourceName
+        Region            = Get-FirstPropertyValue $extended @('region', 'location')
+        SKU               = Get-FirstPropertyValue $extended @('vmSize', 'displaySKU', 'sku', 'recommendedSku')
+        Quantity          = Get-FirstPropertyValue $extended @('targetResourceCount', 'recommendedQuantity', 'quantity')
+        Term              = Get-FirstPropertyValue $extended @('term', 'commitmentTerm')
+        Scope             = Get-FirstPropertyValue $extended @('scope', 'scopeName')
+        LookbackPeriod    = Get-FirstPropertyValue $extended @('lookbackPeriod', 'lookBackPeriod')
+        SavingsAmount     = $savingsAmount
+        SavingsCurrency   = Get-FirstPropertyValue $extended @('savingsCurrency', 'currency')
+        SavingsPercentage = Get-FirstPropertyValue $extended @('savingsPercentage', 'savingsPercent')
+        SavingsBasis      = if ($null -ne $annualSavings) { 'Annual' } else { 'Advisor estimate' }
+        Problem           = $problem
+        Recommendation    = $solution
+        DecisionStatus    = if ($underutilizedVM) { 'Review first' } else { 'Candidate' }
+        DecisionReason    = if ($underutilizedVM) { 'Rightsize or deallocate this VM before purchasing a commitment.' } else { 'Advisor-backed commitment candidate.' }
+        AdvisorId         = $AdvisorRecommendation.id
+    }
+}
+
+function Add-CommitmentRecommendationFromAdvisor {
+    param([object]$AdvisorRecommendation, [string]$SubId, [string]$SubName)
+
+    $candidate = ConvertTo-CommitmentRecommendation $AdvisorRecommendation $SubId $SubName
+    if (-not $candidate) { return }
+    $alreadyAdded = $script:CommitmentRecommendations | Where-Object {
+        $_.AdvisorId -eq $candidate.AdvisorId -and $_.SubscriptionId -eq $candidate.SubscriptionId
+    } | Select-Object -First 1
+    if (-not $alreadyAdded) { $script:CommitmentRecommendations.Add($candidate) }
+}
+
+function ConvertTo-AmountValue {
+    param([object]$Amount)
+
+    if ($null -eq $Amount) { return $null }
+    if ($Amount.PSObject.Properties['value']) { return [double]$Amount.value }
+    try { return [double]$Amount } catch { return $null }
+}
+
+function Get-LookbackDaysValue {
+    param([object]$LookbackPeriod)
+
+    if ($LookbackPeriod -is [int] -or $LookbackPeriod -is [long]) { return [int]$LookbackPeriod }
+    if ("$LookbackPeriod" -match '(\d+)') { return [int]$Matches[1] }
+    return 0
+}
+
+function Get-PercentileValue {
+    param([double[]]$Values, [ValidateRange(0, 100)][double]$Percentile)
+
+    if (-not $Values -or $Values.Count -eq 0) { return $null }
+    $sortedValues = @($Values | Sort-Object)
+    $index = [math]::Ceiling(($Percentile / 100) * $sortedValues.Count) - 1
+    $index = [math]::Max(0, [math]::Min($index, $sortedValues.Count - 1))
+    return [double]$sortedValues[$index]
+}
+
+function Invoke-AzRestMethodWithRetry {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [ValidateRange(1, 10)][int]$MaxAttempts = 6
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Send-KeepAlive
+        try {
+            $invokeParameters = @{ Method = 'GET'; ErrorAction = 'Stop' }
+            if ($Path -match '^https?://') { $invokeParameters.Uri = $Path } else { $invokeParameters.Path = $Path }
+            $response = Invoke-AzRestMethod @invokeParameters
+            if ($response.StatusCode -notin @(429, 503)) { return $response }
+
+            $retryAfter = 0
+            if ($response.Headers) {
+                foreach ($headerName in @('Retry-After', 'x-ms-ratelimit-microsoft.consumption-retry-after', 'x-ms-ratelimit-microsoft.costmanagement-entity-retry-after')) {
+                    $headerValue = $response.Headers[$headerName] | Select-Object -First 1
+                    if ($headerValue -as [int]) { $retryAfter = [math]::Max($retryAfter, [int]$headerValue) }
+                }
+            }
+        } catch {
+            $isTransient = $_.Exception.Message -match '429|503|Too Many Requests|Service Unavailable'
+            if (-not $isTransient -or $attempt -eq $MaxAttempts) { throw }
+            $retryAfter = 0
+            try {
+                $retryAfterDelta = $_.Exception.Response.Headers.RetryAfter.Delta
+                if ($retryAfterDelta) { $retryAfter = [int][math]::Ceiling($retryAfterDelta.TotalSeconds) }
+            } catch { }
+        }
+
+        if ($attempt -eq $MaxAttempts) { return $response }
+        if ($retryAfter -le 0) { $retryAfter = [math]::Min(120, 10 * [math]::Pow(2, $attempt - 1)) }
+        Write-Status "  Azure billing API throttled or unavailable. Automatic retry $($attempt + 1)/$MaxAttempts in $retryAfter seconds..." "WARN"
+        Start-Sleep -Seconds $retryAfter
+    }
+}
+
+function Get-AzRestPagedValues {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $nextPath = $Path
+    while ($nextPath) {
+        $response = Invoke-AzRestMethodWithRetry -Path $nextPath
+        if (-not $response -or $response.StatusCode -eq 204) { break }
+        if ($response.StatusCode -ne 200) { throw "Azure billing API returned HTTP $($response.StatusCode)." }
+        $content = $response.Content | ConvertFrom-Json
+        foreach ($item in @($content.value)) { if ($null -ne $item) { $results.Add($item) } }
+        $nextPath = $content.nextLink
+    }
+    return $results
+}
+
+function ConvertFrom-AzureReservationRecommendation {
+    param([object]$InputObject, [string]$SubId, [string]$SubName)
+
+    $properties = $InputObject.properties
+    $lookbackDays = Get-LookbackDaysValue $properties.lookBackPeriod
+    $paygCost = ConvertTo-AmountValue $properties.costWithNoReservedInstances
+    $benefitCost = ConvertTo-AmountValue $properties.totalCostWithReservedInstances
+    $savingsAmount = ConvertTo-AmountValue $properties.netSavings
+    $currency = if ($properties.netSavings.PSObject.Properties['currency']) { $properties.netSavings.currency } elseif ($properties.costWithNoReservedInstances.PSObject.Properties['currency']) { $properties.costWithNoReservedInstances.currency } else { 'N/A' }
+    $savingsPercentage = if ($paygCost -gt 0 -and $null -ne $savingsAmount) { [math]::Round(($savingsAmount / $paygCost) * 100, 1) } else { $null }
+    $annualSavings = if ($lookbackDays -gt 0 -and $null -ne $savingsAmount) { [math]::Round(($savingsAmount / $lookbackDays) * 365, 2) } else { $null }
+    $sku = if ($InputObject.sku) { $InputObject.sku } elseif ($properties.skuName) { $properties.skuName } else { $properties.normalizedSize }
+    $possibleHours = $lookbackDays * 24 * [double]$properties.recommendedQuantity
+    $projectedUtilization = if ($possibleHours -gt 0 -and $properties.totalHours) { [math]::Round([math]::Min(100, ([double]$properties.totalHours / $possibleHours) * 100), 1) } else { $null }
+    $underutilizedMatch = $script:UnderutilizedResources | Where-Object {
+        $_.Subscription -eq $SubName -and $_.ResourceType -match 'Virtual Machine' -and $_.SKU -eq $sku
+    } | Select-Object -First 1
+    $isCandidate = $properties.recommendedQuantity -gt 0 -and $savingsPercentage -ge 5 -and $projectedUtilization -ge 80 -and -not $underutilizedMatch
+
+    return [PSCustomObject]@{
+        Type                    = 'Reservation'
+        Source                  = 'Azure Reservation Recommendations API'
+        SubscriptionId          = $SubId
+        Subscription            = $SubName
+        ResourceId              = $InputObject.id
+        ResourceName            = if ($sku) { $sku } else { 'Reserved compute' }
+        Region                  = if ($properties.location) { $properties.location } else { $InputObject.location }
+        SKU                     = $sku
+        Family                  = $properties.instanceFlexibilityGroup
+        Quantity                = $properties.recommendedQuantity
+        NormalizedQuantity      = $properties.recommendedQuantityNormalized
+        HourlyCommitment        = $null
+        Term                    = $properties.term
+        Scope                   = $properties.scope
+        LookbackPeriod          = $properties.lookBackPeriod
+        LookbackDays            = $lookbackDays
+        UsageGrain              = 'AggregatedHours'
+        UsageHours              = $properties.totalHours
+        PaygCost                = $paygCost
+        BenefitCost             = $benefitCost
+        SavingsAmount           = $savingsAmount
+        AnnualSavings           = $annualSavings
+        SavingsCurrency         = $currency
+        SavingsPercentage       = $savingsPercentage
+        CoveragePercentage      = $projectedUtilization
+        UtilizationPercentage   = $projectedUtilization
+        WastageCost             = $null
+        BreakEven               = if ($savingsAmount -gt 0) { "Net-positive in ${lookbackDays}-day Azure simulation" } else { 'Not reached' }
+        ExistingBenefitsIncluded = $true
+        DecisionStatus          = if ($isCandidate) { 'Candidate' } else { 'Review first' }
+        DecisionReason          = if ($underutilizedMatch) { 'Rightsize matching underutilized VMs before reserving this SKU.' } elseif ($savingsPercentage -lt 5) { 'Projected savings are below the conservative 5% threshold.' } elseif ($projectedUtilization -lt 80) { 'Projected reservation utilization is below 80%.' } else { 'Azure-calculated SKU and regional reservation candidate.' }
+        Recommendation          = "Evaluate quantity $($properties.recommendedQuantity) for $sku in $($properties.term); validate workload continuity before purchase."
+        AdvisorId               = $InputObject.id
+    }
+}
+
+function ConvertFrom-AzureSavingsPlanRecommendation {
+    param([object]$InputObject, [string]$SubId, [string]$SubName)
+
+    $properties = $InputObject.properties
+    $details = $properties.recommendationDetails
+    $lookbackDays = Get-LookbackDaysValue $properties.lookBackPeriod
+    $charges = @($properties.usage.charges | ForEach-Object { [double]$_ })
+    $averageHourlyCharge = if ($charges.Count -gt 0) { [math]::Round(($charges | Measure-Object -Average).Average, 4) } else { $null }
+    $p95HourlyCharge = Get-PercentileValue -Values $charges -Percentile 95
+    if ($null -ne $p95HourlyCharge) { $p95HourlyCharge = [math]::Round($p95HourlyCharge, 4) }
+    $annualSavings = if ($lookbackDays -gt 0 -and $null -ne $details.savingsAmount) { [math]::Round(([double]$details.savingsAmount / $lookbackDays) * 365, 2) } else { $null }
+    $wastageThreshold = [math]::Max(1, ([double]$details.benefitCost * 0.02))
+    $isCandidate = $details.savingsPercentage -ge 5 -and $details.averageUtilizationPercentage -ge 90 -and $details.wastageCost -le $wastageThreshold
+
+    return [PSCustomObject]@{
+        Type                    = 'SavingsPlan'
+        Source                  = 'Azure Benefit Recommendations API'
+        SubscriptionId          = $SubId
+        Subscription            = $SubName
+        ResourceId              = $InputObject.id
+        ResourceName            = 'Compute Savings Plan'
+        Region                  = 'Scope-wide'
+        SKU                     = $properties.armSkuName
+        Family                  = 'Eligible compute'
+        Quantity                = $null
+        NormalizedQuantity      = $null
+        HourlyCommitment        = $details.commitmentAmount
+        Term                    = $properties.term
+        Scope                   = $properties.scope
+        LookbackPeriod          = $properties.lookBackPeriod
+        LookbackDays            = $lookbackDays
+        UsageGrain              = $properties.usage.usageGrain
+        UsageHours              = $properties.totalHours
+        AverageHourlyCharge     = $averageHourlyCharge
+        P95HourlyCharge         = $p95HourlyCharge
+        PaygCost                = $properties.costWithoutBenefit
+        BenefitCost             = $details.totalCost
+        SavingsAmount           = $details.savingsAmount
+        AnnualSavings           = $annualSavings
+        SavingsCurrency         = $properties.currencyCode
+        SavingsPercentage       = $details.savingsPercentage
+        CoveragePercentage      = $details.coveragePercentage
+        UtilizationPercentage   = $details.averageUtilizationPercentage
+        WastageCost             = $details.wastageCost
+        BreakEven               = if ($details.savingsAmount -gt 0) { "Net-positive in ${lookbackDays}-day Azure simulation" } else { 'Not reached' }
+        ExistingBenefitsIncluded = $true
+        DecisionStatus          = if ($isCandidate) { 'Candidate' } else { 'Review first' }
+        DecisionReason          = if ($details.savingsPercentage -lt 5) { 'Projected savings are below the conservative 5% threshold.' } elseif ($details.averageUtilizationPercentage -lt 90) { 'Projected commitment utilization is below 90%.' } elseif ($details.wastageCost -gt $wastageThreshold) { 'Projected commitment wastage exceeds the conservative threshold.' } else { 'Azure-calculated scope recommendation using hourly eligible compute charges.' }
+        Recommendation          = "Evaluate an hourly commitment of $($details.commitmentAmount) $($properties.currencyCode) for $($properties.term); validate scope and recent workload changes before purchase."
+        AdvisorId               = $InputObject.id
+    }
+}
+
+function Resolve-CommitmentRecommendationDecision {
+    param([string]$SubId)
+
+    $nativeRecommendations = @($script:CommitmentRecommendations | Where-Object {
+        $_.SubscriptionId -eq $SubId -and $_.Source -match 'Recommendations API'
+    })
+    $eligible = @($nativeRecommendations | Where-Object {
+        $_.DecisionStatus -eq 'Candidate' -and $null -ne $_.AnnualSavings -and $_.AnnualSavings -gt 0
+    } | Sort-Object AnnualSavings -Descending)
+    if ($eligible.Count -eq 0) { return }
+
+    $preferred = $eligible[0]
+    $preferred.DecisionStatus = 'Preferred'
+    if ($preferred.PSObject.Properties['DecisionReason']) {
+        $preferred.DecisionReason = "Highest Azure-projected annual savings among eligible options; do not purchase overlapping alternatives simultaneously."
+    } else {
+        $preferred | Add-Member -NotePropertyName DecisionReason -NotePropertyValue "Highest Azure-projected annual savings among eligible options; do not purchase overlapping alternatives simultaneously."
+    }
+    foreach ($alternative in ($eligible | Select-Object -Skip 1)) {
+        $alternative.DecisionStatus = 'Alternative'
+        if ($alternative.PSObject.Properties['DecisionReason']) {
+            $alternative.DecisionReason = "Valid Azure candidate, but lower projected annual savings than the preferred option. Compare flexibility and scope before choosing."
+        } else {
+            $alternative | Add-Member -NotePropertyName DecisionReason -NotePropertyValue "Valid Azure candidate, but lower projected annual savings than the preferred option. Compare flexibility and scope before choosing."
+        }
+    }
+}
+
+function Get-NativeCommitmentRecommendations {
+    param([string]$SubId, [string]$SubName)
+
+    if ($script:CommitmentRecommendations | Where-Object { $_.SubscriptionId -eq $SubId -and $_.Source -match 'Recommendations API' }) { return }
+    $lookback = "Last${CommitmentLookbackDays}Days"
+    Write-Status "  Retrieving Azure-native commitment recommendations ($CommitmentLookbackDays-day lookback)..." "INFO"
+
+    try {
+        $filter = [uri]::EscapeDataString("properties/scope eq 'Single' AND properties/resourceType eq 'VirtualMachines' AND properties/lookBackPeriod eq '$lookback'")
+        $path = "/subscriptions/$SubId/providers/Microsoft.Consumption/reservationRecommendations?api-version=2024-08-01&`$filter=$filter"
+        foreach ($item in @(Get-AzRestPagedValues -Path $path)) {
+            $candidate = ConvertFrom-AzureReservationRecommendation $item $SubId $SubName
+            if ($candidate) { $script:CommitmentRecommendations.Add($candidate) }
+        }
+    } catch {
+        Write-Status "  Reservation purchase recommendations unavailable: $($_.Exception.Message)" "INFO"
+    }
+
+    foreach ($term in @('P1Y', 'P3Y')) {
+        try {
+            $filter = [uri]::EscapeDataString("properties/scope eq 'Single' AND properties/lookBackPeriod eq '$lookback' AND properties/term eq '$term'")
+            $path = "/subscriptions/$SubId/providers/Microsoft.CostManagement/benefitRecommendations?api-version=2025-03-01&`$filter=$filter&`$expand=properties/usage,properties/allRecommendationDetails"
+            foreach ($item in @(Get-AzRestPagedValues -Path $path)) {
+                if ($item.kind -eq 'SavingsPlan') {
+                    $candidate = ConvertFrom-AzureSavingsPlanRecommendation $item $SubId $SubName
+                    if ($candidate) { $script:CommitmentRecommendations.Add($candidate) }
+                }
+            }
+        } catch {
+            Write-Status "  Savings Plan $term recommendations unavailable: $($_.Exception.Message)" "INFO"
+        }
+    }
+
+    Resolve-CommitmentRecommendationDecision -SubId $SubId
+    $nativeCount = @($script:CommitmentRecommendations | Where-Object { $_.SubscriptionId -eq $SubId -and $_.Source -match 'Recommendations API' }).Count
+    Write-Status "  Azure-native commitment candidates: $nativeCount" $(if ($nativeCount -gt 0) { 'OK' } else { 'INFO' })
 }
 
 function Invoke-AzCommandSafely {
@@ -3897,6 +4235,7 @@ function Analyze-CostAdvisor {
         if ($script:CachedAdvisorCost.ContainsKey($SubId)) {
             $costRecs = $script:CachedAdvisorCost[$SubId]
             foreach ($rec in $costRecs) {
+                Add-CommitmentRecommendationFromAdvisor $rec $SubId $SubName
                 $resId   = if ($rec.properties.resourceMetadata.resourceId) { $rec.properties.resourceMetadata.resourceId } else { $rec.id }
                 $resName = if ($resId) { $resId.Split('/')[-1] } else { 'N/A' }
                 $resType = if ($rec.properties.impactedField) { $rec.properties.impactedField.Split('/')[-1] } else { 'Azure Resource' }
@@ -3919,6 +4258,7 @@ function Analyze-CostAdvisor {
             $advisorData = ($advisorResp.Content | ConvertFrom-Json)
             $costRecs = $advisorData.value | Where-Object { $_.properties.category -eq 'Cost' }
             foreach ($rec in $costRecs) {
+                Add-CommitmentRecommendationFromAdvisor $rec $SubId $SubName
                 $resId   = $rec.properties.resourceMetadata.resourceId
                 $resName = if ($resId) { $resId.Split('/')[-1] } else { 'N/A' }
                 $resType = if ($rec.properties.impactedField) { $rec.properties.impactedField.Split('/')[-1] } else { 'Azure Resource' }
@@ -4054,6 +4394,25 @@ function Analyze-Reservations {
 
     Write-Status "Analyzing Azure Reservations & Savings Plans..." "SECTION"
 
+    Get-NativeCommitmentRecommendations -SubId $SubId -SubName $SubName
+    $preferredCommitment = $script:CommitmentRecommendations | Where-Object {
+        $_.SubscriptionId -eq $SubId -and $_.DecisionStatus -eq 'Preferred'
+    } | Select-Object -First 1
+    if ($preferredCommitment) {
+        $commitmentDescription = if ($preferredCommitment.Type -eq 'SavingsPlan') {
+            "$($preferredCommitment.HourlyCommitment) $($preferredCommitment.SavingsCurrency) per hour"
+        } else {
+            "quantity $($preferredCommitment.Quantity) of $($preferredCommitment.SKU) in $($preferredCommitment.Region)"
+        }
+        Add-Finding -Pillar "Cost Optimization" -Severity "Medium" -Category "Cost - Commitment Purchase Recommendation" `
+            -ResourceName $preferredCommitment.ResourceName -ResourceType $preferredCommitment.Type -ResourceGroup "N/A" `
+            -Subscription $SubName `
+            -Description "Azure recommends $commitmentDescription for $($preferredCommitment.Term), based on $($preferredCommitment.LookbackDays) days of eligible usage. Projected annual savings: $($preferredCommitment.AnnualSavings) $($preferredCommitment.SavingsCurrency) ($($preferredCommitment.SavingsPercentage)%)." `
+            -Recommendation "Validate workload continuity, scope, and commercial terms, then review the preferred option in the Reservations report. Do not purchase overlapping RI and Savings Plan alternatives simultaneously." `
+            -Impact "Azure projects $($preferredCommitment.CoveragePercentage)% coverage and $($preferredCommitment.UtilizationPercentage)% commitment utilization. Existing eligible benefits are included by Azure's recommendation model." `
+            -Source "Azure Advisor"
+    }
+
     # ── 1. Reservation Orders (tenant-wide, fetched once) ──
     if ($script:ReservationData.Count -eq 0) {
         try {
@@ -4170,7 +4529,8 @@ function Analyze-Reservations {
     $spItems = @($script:ReservationData | Where-Object { $_.Type -eq 'SavingsPlan' })
 
     # No reservations at all
-    if ($riItems.Count -eq 0 -and $spItems.Count -eq 0 -and $script:ReservationData.Count -eq 0) {
+    $subCommitmentRecommendations = @($script:CommitmentRecommendations | Where-Object { $_.SubscriptionId -eq $SubId })
+    if ($script:ReservationData.Count -eq 0 -and $subCommitmentRecommendations.Count -eq 0) {
         # Check if there are VMs or SQL that could benefit
         $vmCount = @($script:CachedVMs).Count
         $sqlCount = @($script:CachedSqlServers).Count
@@ -8080,7 +8440,7 @@ function Generate-HTMLReport {
     $riItems = @($script:ReservationData | Where-Object { $_.Type -eq 'Reservation' })
     $spItems = @($script:ReservationData | Where-Object { $_.Type -eq 'SavingsPlan' })
     $riTotal = $script:ReservationData.Count
-    $riActive = @($script:ReservationData | Where-Object { $_.DaysToExpiry -ge 0 -or $_.DaysToExpiry -eq -1 -and $_.Status -eq 'Succeeded' }).Count
+    $riActive = @($script:ReservationData | Where-Object { $_.DaysToExpiry -ge 0 -or ($_.DaysToExpiry -eq -1 -and $_.Status -eq 'Succeeded') }).Count
     $riExpiring = @($script:ReservationData | Where-Object { $_.DaysToExpiry -ge 0 -and $_.DaysToExpiry -le 90 }).Count
     $riExpired = @($script:ReservationData | Where-Object { $_.DaysToExpiry -lt 0 -and $_.ExpiryDate }).Count
     $riLowUtil = @($script:ReservationData | Where-Object { $_.UtilizationPct -ge 0 -and $_.UtilizationPct -lt 50 }).Count
@@ -8089,7 +8449,7 @@ function Generate-HTMLReport {
     if ($riWithUtil.Count -gt 0) { $riAvgUtil = [math]::Round(($riWithUtil | Measure-Object -Property UtilizationPct -Average).Average, 1) }
 
     $reservationRowsBuilder = [System.Text.StringBuilder]::new()
-    foreach ($ri in ($script:ReservationData | Sort-Object @{Expression={ switch($_.Type) { 'Reservation'{0} 'SavingsPlan'{1} default{2} } }}, @{Expression={ $_.UtilizationPct }})) {
+    foreach ($ri in ($script:ReservationData | Sort-Object @{Expression={ switch($_.Type) { 'Reservation'{0} 'SavingsPlan'{1} default{2} } }}, @{Expression={ if ($_.UtilizationPct -lt 0) { [double]::PositiveInfinity } else { $_.UtilizationPct } }})) {
         $typeIcon = if ($ri.Type -eq 'SavingsPlan') { '💳' } else { '🎫' }
         $typeLabel = if ($ri.Type -eq 'SavingsPlan') { 'Savings Plan' } else { 'Reserved Instance' }
         $statusClass = if ($ri.DaysToExpiry -lt 0 -and $ri.ExpiryDate) { 'critical' } elseif ($ri.DaysToExpiry -ge 0 -and $ri.DaysToExpiry -le 30) { 'critical' } elseif ($ri.DaysToExpiry -ge 0 -and $ri.DaysToExpiry -le 90) { 'medium' } else { 'low' }
@@ -8099,9 +8459,39 @@ function Generate-HTMLReport {
         $purchaseStr = if ($ri.PurchaseDate) { $ri.PurchaseDate.ToString('yyyy-MM-dd') } else { 'N/A' }
         $expiryStr = if ($ri.ExpiryDate) { $ri.ExpiryDate.ToString('yyyy-MM-dd') } else { 'N/A' }
         $daysStr = if ($ri.DaysToExpiry -ge 0) { "$($ri.DaysToExpiry)d" } elseif ($ri.ExpiryDate) { 'Expired' } else { 'N/A' }
-        [void]$reservationRowsBuilder.Append("<tr class=`"ri-row`" data-type=`"$($ri.Type)`" data-status=`"$statusLabel`"><td>$typeIcon $typeLabel</td><td><strong>$($ri.DisplayName)</strong><br><small style=`"color:#605e5c`">$($ri.ResourceType)</small></td><td><code style=`"background:#e1dfdd;padding:2px 6px;border-radius:4px;font-size:.85em`">$($ri.SKU)</code></td><td style=`"text-align:center`">$($ri.Quantity)</td><td>$($ri.Term)</td><td>$($ri.Scope)</td><td style=`"text-align:center`"><span style=`"font-size:1.2em;font-weight:700;color:$utilColor`">$utilDisplay</span></td><td style=`"text-align:center;font-size:.85em`">$purchaseStr</td><td style=`"text-align:center`"><span class=`"severity-badge $statusClass`">$statusLabel</span><br><small style=`"color:#605e5c`">$expiryStr ($daysStr)</small></td></tr>")
+        [void]$reservationRowsBuilder.Append("<tr class=`"ri-row`" data-type=`"$(ConvertTo-SafeHtml $ri.Type)`" data-status=`"$(ConvertTo-SafeHtml $statusLabel)`"><td>$typeIcon $(ConvertTo-SafeHtml $typeLabel)</td><td><strong>$(ConvertTo-SafeHtml $ri.DisplayName)</strong><br><small style=`"color:#605e5c`">$(ConvertTo-SafeHtml $ri.ResourceType)</small></td><td><code style=`"background:#e1dfdd;padding:2px 6px;border-radius:4px;font-size:.85em`">$(ConvertTo-SafeHtml $ri.SKU)</code></td><td style=`"text-align:center`">$(ConvertTo-SafeHtml "$($ri.Quantity)")</td><td>$(ConvertTo-SafeHtml $ri.Term)</td><td>$(ConvertTo-SafeHtml $ri.Scope)</td><td style=`"text-align:center`"><span style=`"font-size:1.2em;font-weight:700;color:$utilColor`">$(ConvertTo-SafeHtml $utilDisplay)</span></td><td style=`"text-align:center;font-size:.85em`">$(ConvertTo-SafeHtml $purchaseStr)</td><td style=`"text-align:center`"><span class=`"severity-badge $statusClass`">$(ConvertTo-SafeHtml $statusLabel)</span><br><small style=`"color:#605e5c`">$(ConvertTo-SafeHtml "$expiryStr ($daysStr)")</small></td></tr>")
     }
     $reservationRows = $reservationRowsBuilder.ToString()
+
+    $nativeRecommendationSubscriptions = @($script:CommitmentRecommendations | Where-Object { $_.Source -match 'Recommendations API' } | Select-Object -ExpandProperty SubscriptionId -Unique)
+    $displayCommitmentRecommendations = @($script:CommitmentRecommendations | Where-Object {
+        $_.Source -match 'Recommendations API' -or $_.SubscriptionId -notin $nativeRecommendationSubscriptions
+    })
+    $commitmentRecommendationRowsBuilder = [System.Text.StringBuilder]::new()
+    foreach ($recommendation in ($displayCommitmentRecommendations | Sort-Object @{Expression={ switch ($_.DecisionStatus) { 'Preferred' { 0 } 'Candidate' { 1 } 'Alternative' { 2 } default { 3 } } }}, Subscription, Type, Term)) {
+        $typeLabel = if ($recommendation.Type -eq 'SavingsPlan') { 'Savings Plan' } else { 'Reserved Instance' }
+        $commitment = if ($null -ne $recommendation.HourlyCommitment) { "$($recommendation.HourlyCommitment) $($recommendation.SavingsCurrency)/hour" } elseif ($recommendation.Quantity) { "Qty $($recommendation.Quantity)" } else { 'N/A' }
+        $term = if ($recommendation.Term) { $recommendation.Term } else { 'N/A' }
+        $lookback = if ($recommendation.LookbackPeriod) { $recommendation.LookbackPeriod } else { 'N/A' }
+        $region = if ($recommendation.Region) { $recommendation.Region } else { 'N/A' }
+        $sku = if ($recommendation.SKU) { $recommendation.SKU } else { 'N/A' }
+        $costComparison = if ($null -ne $recommendation.PaygCost -and $null -ne $recommendation.BenefitCost) {
+            "$(([double]$recommendation.PaygCost).ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)) -> $(([double]$recommendation.BenefitCost).ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)) $($recommendation.SavingsCurrency)"
+        } else { 'N/A' }
+        $savings = if ($null -ne $recommendation.AnnualSavings) {
+            "$(([double]$recommendation.AnnualSavings).ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)) $($recommendation.SavingsCurrency)/year ($($recommendation.SavingsPercentage)%)"
+        } elseif ($null -ne $recommendation.SavingsAmount) {
+            "$($recommendation.SavingsAmount) $($recommendation.SavingsCurrency)"
+        } elseif ($null -ne $recommendation.SavingsPercentage) {
+            "$($recommendation.SavingsPercentage)%"
+        } else { 'N/A' }
+        $coverage = if ($null -ne $recommendation.CoveragePercentage) { "$($recommendation.CoveragePercentage)%" } else { 'N/A' }
+        $utilization = if ($null -ne $recommendation.UtilizationPercentage) { "$($recommendation.UtilizationPercentage)%" } else { 'N/A' }
+        $decisionColor = switch ($recommendation.DecisionStatus) { 'Preferred' { '#107c10' } 'Candidate' { '#107c10' } 'Alternative' { '#0078d4' } default { '#ca5010' } }
+        [void]$commitmentRecommendationRowsBuilder.Append("<tr><td><strong>$(ConvertTo-SafeHtml $typeLabel)</strong><br><small>$(ConvertTo-SafeHtml $recommendation.Source)</small></td><td>$(ConvertTo-SafeHtml $recommendation.Subscription)</td><td><code>$(ConvertTo-SafeHtml $sku)</code><br><small>$(ConvertTo-SafeHtml $region)</small></td><td>$(ConvertTo-SafeHtml $commitment)<br><small>$(ConvertTo-SafeHtml $term), $(ConvertTo-SafeHtml $lookback)</small></td><td>$(ConvertTo-SafeHtml $costComparison)</td><td><strong>$(ConvertTo-SafeHtml $savings)</strong></td><td>$(ConvertTo-SafeHtml $coverage) / $(ConvertTo-SafeHtml $utilization)</td><td>$(ConvertTo-SafeHtml $recommendation.BreakEven)</td><td><strong style=`"color:$decisionColor`">$(ConvertTo-SafeHtml $recommendation.DecisionStatus)</strong><br><small>$(ConvertTo-SafeHtml $recommendation.DecisionReason)</small></td></tr>")
+    }
+    $commitmentRecommendationRows = $commitmentRecommendationRowsBuilder.ToString()
+    $commitmentRecommendationCount = $displayCommitmentRecommendations.Count
 
     # Generate network topology — modern card layout
     $netVnets    = @($script:NetworkTopology | Where-Object { $_.Type -eq 'VNet' })
@@ -11017,6 +11407,10 @@ function Generate-HTMLReport {
         <!-- KPI Cards -->
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:14px;margin-bottom:24px;">
             <div class="card" style="text-align:center;padding:16px;">
+                <div style="font-size:2em;font-weight:700;color:#107c10;">$commitmentRecommendationCount</div>
+                <div style="font-size:.8em;color:var(--text-dim);font-weight:600;">Purchase Recommendations</div>
+            </div>
+            <div class="card" style="text-align:center;padding:16px;">
                 <div style="font-size:2em;font-weight:700;color:var(--accent-dark);">$riTotal</div>
                 <div style="font-size:.8em;color:var(--text-dim);font-weight:600;">Total Commitments</div>
             </div>
@@ -11039,6 +11433,29 @@ function Generate-HTMLReport {
             <div class="card" style="text-align:center;padding:16px;">
                 <div style="font-size:2em;font-weight:700;color:$(if($riLowUtil -gt 0){'#d13438'}else{'#107c10'});">$riLowUtil</div>
                 <div style="font-size:.8em;color:var(--text-dim);font-weight:600;">Low Util (&lt;50%)</div>
+            </div>
+        </div>
+
+        <div class="card" style="padding:0;overflow:hidden;margin-bottom:24px;">
+            <div style="padding:14px 20px;background:#107c10;color:#fff;">
+                <h3 style="margin:0;font-size:15px;">Azure Purchase Recommendations</h3>
+            </div>
+            <div style="padding:16px;">
+$(if ($commitmentRecommendationCount -gt 0) { @"
+                <p style="font-size:.85em;color:var(--text-dim);margin:0 0 14px;">Azure calculates these options from actual eligible usage and negotiated costs over $CommitmentLookbackDays days. Preferred and alternative options can overlap; purchase only one after validating workload continuity and commercial terms.</p>
+                <table>
+                    <thead><tr>
+                        <th>Type</th><th>Subscription</th><th>SKU / Region</th>
+                        <th>Commitment / Term</th><th>PAYG → Benefit</th><th>Annual Savings</th>
+                        <th>Coverage / Util.</th><th>Break-even</th><th>Decision</th>
+                    </tr></thead>
+                    <tbody>$commitmentRecommendationRows</tbody>
+                </table>
+"@ } else { @"
+                <div style="text-align:center;padding:24px;color:var(--text-dim);">
+                    No Azure-backed Reservation or Savings Plan purchase recommendations were returned. This does not imply that no opportunity exists; Cost Management access or sufficient usage history may be required.
+                </div>
+"@ })
             </div>
         </div>
 
@@ -14907,8 +15324,8 @@ try {
 # SIG # Begin signature block
 # MIIcEQYJKoZIhvcNAQcCoIIcAjCCG/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCl+Gl+FdjIjZfb
-# daVMKNu++BisOZppmEBbz4dTDtY8P6CCFlQwggMWMIIB/qADAgECAhB05LE1IRL+
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD59Y9oBpx/bj7p
+# 8SYPjkzJsqd2M6xzVWFlw2zuiwD4FqCCFlQwggMWMIIB/qADAgECAhB05LE1IRL+
 # rkeuEM34A+X/MA0GCSqGSIb3DQEBCwUAMCMxITAfBgNVBAMMGFBhYmxvQVIgQXp1
 # cmUgQXNzZXNzbWVudDAeFw0yNjA1MjMwMTM5MDdaFw0zMTA1MjMwMTQ5MDRaMCMx
 # ITAfBgNVBAMMGFBhYmxvQVIgQXp1cmUgQXNzZXNzbWVudDCCASIwDQYJKoZIhvcN
@@ -15031,28 +15448,28 @@ try {
 # HwYDVQQDDBhQYWJsb0FSIEF6dXJlIEFzc2Vzc21lbnQCEHTksTUhEv6uR64QzfgD
 # 5f8wDQYJYIZIAWUDBAIBBQCggYQwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKAADAZ
 # BgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYKKwYB
-# BAGCNwIBFTAvBgkqhkiG9w0BCQQxIgQgh7zGxwVbeZe1ES7D1pjnkr9lYFNRu+PI
-# dGSj1MjmFlcwDQYJKoZIhvcNAQEBBQAEggEAQBPvRDKmMkxQ2+mP0SxRg51Is1Dx
-# JtCCLaZSu4ukw+BWE/D51QQEGoeDwyfV+KJ8JG9+a48IWXu5/yRNxLezu3liUWRe
-# jgyI7yushEAIBhdM3RGgihct0CdV+Wh59E9gqhMV79y+yD2/LRiqp+j81CHlWeKu
-# EQ3MoT+RkPFx6J0ekPonp5opbkPcqfTYXCS4259AxDxONU5eL6koVe0CdIvhv8Db
-# W7Uhkx/L9PaGsg6ZvHNIDMADUVFnEeIA36lhAYjKfAN1JsYK+OodB7q0R/aVJ4T6
-# 00UAOByHxXt6NGzOWpviYSGGgEdTDT4tNM4Jq0Aqrpb1wgdSuS/zlaN5WaGCAyYw
+# BAGCNwIBFTAvBgkqhkiG9w0BCQQxIgQgCMqR8WCEKN55KL3odyZdBXWI5Dla99d+
+# qOUZCwpsSCAwDQYJKoZIhvcNAQEBBQAEggEAkzR5auQFvqNGg/rrqykZbtQUFblw
+# +nI1/x5hzbLhI1PPeZK2eC3aw6JqoNequcUDVNGNSC0Sv2wPLj0yXjOuxpAMhkz+
+# K9C+JEWh5c+DGIy6MPGtOb0P4fMLO2Je91hwa2UqTFl8Av6q+OdC1BDYD77BhaYU
+# XrEZcC0E+FQVNI5ZCX92v9HyGegj4gYqfih+SyIeLM/MqdUC28/V5ItqSokyBfz1
+# O5lI9hMw9sxdiBFdsLyG5IANUIneYQ4REgTGP3kMlZqk3sXs5HPnMrHLgwIkhuyF
+# G+F5qptiNudX/ZxQNV8yZINA+XUh2aOe6EqfFwC8eVBncKyLzox7wDhWLaGCAyYw
 # ggMiBgkqhkiG9w0BCQYxggMTMIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYD
 # VQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBH
 # NCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO
 # 28MPj/mSGDUwDQYJYIZIAWUDBAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcN
-# AQcBMBwGCSqGSIb3DQEJBTEPFw0yNjA5MDkxNDE2MThaMC8GCSqGSIb3DQEJBDEi
-# BCAT46u6Sf34xx5SinW78O7bRPaIUBJAeXqaLyjRQ3zOUDANBgkqhkiG9w0BAQEF
-# AASCAgBTFz5xLsvsESf9+mggT0iEIqmNuqRHk5KjFpTcIzlV+BzRWx2hz+XLxa+K
-# wzHj7vsQo4MAFWom7eR8RVScygjnnmW75hgUEzxfBnI8Wb3qNgmhU+c2YwGWicHZ
-# q3hCi6CoY7BgYgxX/Zqi5UQNQbrXVATYOBM555N9UfEU/ZCxkTkl90+QeEJYeOVH
-# BceziXrXIZ0EDFtvWALI9UPEz5n8hFcyKI8ZUG/dDDgaQvY+m1CGfSVI6cciDjCC
-# GRuUOVIWc3UuTVmt3jxRk1w9k7PlRsgX7IoeiDeWHTKI58tGe+UYkXO/uBIKpdlM
-# rHca52bwI8f/1AIY/mf2ixlJLA9BBTj4Mg2JTfEa7KjUXiGjQO7qdhVgsGINi2fN
-# lYxCDs4kE9QHHqMkgMmcYd5wBzxjZpr/jof1anpm3OM7wrz1Par+8j7i8XUdYUPB
-# jy3ZeEj68nIIZ36Uv4Dw8woZextdSLNxvV5F6fD4aC+cI2CjhoxcD3YF39g9PREY
-# qGm7GH/32/z1GXgpiMPGJs/8kdbI5/PQPxxNNy/lzUAmIWCfUQz0WHsu1YKx/GhP
-# b0B2F6/WOj4YNQNGP4WDnoU5BUdN/UzXKfi1KLzF6rJOxFm0DiKtFekT9Dp3Sxp8
-# KTEWB1IkQHR4sWFpO4bzGniUCipvvxBiRIpy6W/TFwCQYZkKjg==
+# AQcBMBwGCSqGSIb3DQEJBTEPFw0yNjA5MDkxNjA2MTJaMC8GCSqGSIb3DQEJBDEi
+# BCDX1UJNe2X2eVD9e5mYAQd6FLDscQqMwOrX2u//yJuA2TANBgkqhkiG9w0BAQEF
+# AASCAgBDLqvifptDWKZUtw8x2EipjfdhgyzAl6KmcGXwq/7j1dcVOtAI1wuDqybD
+# wVRUL3LAtitvqphnzeQhNoWPdYHtLZg2tDRTQXSwYhXPyxtWs4s8eiOPJ0wbvhQE
+# 7QM8SeBQl14y1s37yTAikdERNDWBs/49N6WKAvCn3EuyZK0g30KI6oyNAfSSvLn7
+# rzfaGjln/BkE4UWwTy+B1jgJOlWD1wH69A0Xirqh/NQVwj9pADpEceBOpgZ0m5tK
+# dQVKkxBoK28hh7SBuFE3CYZquuvNkkx9nxJfs25RgrX/8RXOSmynm3DnKg2jQmtb
+# y+AM+n6WcNymwEfN52LjJMtmUKKkE2CNZwPUOJbAenSMKEpbmGSOLwJOe9DwfagD
+# uDdcD1Ss6KjDkifs92OOdtXpNbIv+E8Wd+iQDEQjabtfquGvpAj+srKlnIa44Zg9
+# idgpKXZjc0BwcQg83CiCfLmBazv9wHwwTvNXrZ/MBDTilz/zRgPsBW+n7Bym5YDg
+# THSkA0gHPwBrnA4X5vyVF1oNe1fN3jXHy45Yl6MJmV8ES0Dd4OqbfCq+8SKkLaMi
+# NM8BEqDl4WhhTafch6AGJF3Kfu94AWQpkssRsQDxYmrRJPe2brq/3D34q2iC0OlC
+# +Fqu0J4jfK1ZnXT4vQefvf4GjRHXXFSDGB2QcWKOOX4xlFByuw==
 # SIG # End signature block
