@@ -223,17 +223,15 @@ The script is digitally signed with an Authenticode certificate. The signature g
 
 ### Runtime Integrity Check
 
-At startup, the script validates its own digital signature before executing any code:
+At startup, the script checks its Authenticode signature when the host supports it. By default, an invalid, missing, or untrusted signature produces a warning and execution continues. This avoids blocking execution on customer workstations that do not trust the author's certificate.
 
-```
-╔══════════════════════════════════════════════════════════════╗
-║  SCRIPT INTEGRITY CHECK FAILED                             ║
-║  This script has been modified or the signature is missing. ║
-║  Execution blocked for security. Contact the author.       ║
-╚══════════════════════════════════════════════════════════════╝
+Use strict enforcement when the signing certificate is trusted on the computer:
+
+```powershell
+./Azure-Tenant-Assessment.ps1 -RequireValidSignature
 ```
 
-If the script has been altered in any way — even a single character — execution is blocked immediately.
+In strict mode, execution is blocked unless PowerShell reports the signature status as `Valid`.
 
 ### SOC/EDR Compatibility
 
