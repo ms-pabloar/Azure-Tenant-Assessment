@@ -74,8 +74,8 @@ The script requires **read-only** access. No write permissions are needed.
 ```powershell
 # 1. Upload the script to Cloud Shell (drag & drop or use the Upload button)
 
-# 2. Run the assessment (Cloud Shell is already authenticated)
-./Azure-Tenant-Assessment.ps1 -SkipLogin
+# 2. Run the assessment (the existing Cloud Shell session is reused automatically)
+./Azure-Tenant-Assessment.ps1
 
 # 3. Download the output folder when complete
 ```
@@ -114,7 +114,7 @@ Connect-AzAccount
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `-SubscriptionId` | string | *(all)* | Analyze a specific subscription only |
-| `-SkipLogin` | switch | false | Skip `Connect-AzAccount`; use existing session |
+| `-SkipLogin` | switch | false | Explicitly skip `Connect-AzAccount`; Cloud Shell sessions are detected automatically |
 | `-OutputPath` | string | `./AzureAssessment_<timestamp>` | Output directory for all generated files |
 | `-SkipMetrics` | switch | false | Skip Azure Monitor metrics collection (faster execution) |
 | `-SkipKeyVaultDataPlane` | switch | false | Skip Key Vault secret/certificate enumeration |
@@ -192,6 +192,7 @@ Real-time utilization data is collected via `Get-AzMetric` with configurable tim
 Cost data is collected via the Azure Cost Management REST API (`Microsoft.CostManagement/query`):
 - **6-month lookback** with monthly granularity
 - **Grouped by service name** (Virtual Machines, Storage, Networking, etc.)
+- **Automatic throttling recovery** — retries HTTP 429 responses up to 6 times, honoring Azure retry headers with exponential backoff as fallback
 - Requires `Cost Management Reader` role (optional; gracefully skipped)
 
 ### Microsoft Graph (Optional)
@@ -249,6 +250,7 @@ The script is distributed as **plain-text PowerShell** with no encoding, compres
 For large tenants (50+ subscriptions), execution can take several hours. The script includes built-in resilience:
 
 - **Keep-alive heartbeat** — writes to console every 30 seconds to prevent Cloud Shell idle timeout (20 minutes)
+- **Session reuse** — detects the authenticated Cloud Shell context and avoids a duplicate `Connect-AzAccount` session
 - **Token refresh** — automatically refreshes Azure access tokens every 15 minutes to prevent expiration
 - **Network retry** — retries subscription context switches up to 3 times with exponential backoff on transient DNS/network failures
 - **Early abort** — detects persistent network failures (3+ consecutive) and generates the report with data collected so far, rather than failing silently

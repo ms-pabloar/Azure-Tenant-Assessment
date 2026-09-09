@@ -360,6 +360,55 @@ function Invoke-AzCommandSafely {
     }
 }
 
+function Invoke-CostManagementQuery {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Payload,
+        [ValidateRange(1, 10)][int]$MaxAttempts = 6
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Send-KeepAlive
+        try {
+            $response = Invoke-AzRestMethod -Path $Path -Method POST -Payload $Payload -ErrorAction Stop
+            if ($response.StatusCode -ne 429) { return $response }
+
+            $retryAfter = 0
+            if ($response.Headers) {
+                $retryHeaders = @(
+                    'Retry-After',
+                    'x-ms-ratelimit-microsoft.costmanagement-entity-retry-after',
+                    'x-ms-ratelimit-microsoft.costmanagement-clienttype-retry-after',
+                    'x-ms-ratelimit-microsoft.costmanagement-qpu-retry-after'
+                )
+                foreach ($headerName in $retryHeaders) {
+                    $retryAfterHeader = $response.Headers[$headerName] | Select-Object -First 1
+                    if ($retryAfterHeader -as [int]) {
+                        $retryAfter = [math]::Max($retryAfter, [int]$retryAfterHeader)
+                    }
+                }
+            }
+        } catch {
+            $isThrottled = $_.Exception.Message -match '429|Too Many Requests|too many requests'
+            if (-not $isThrottled -or $attempt -eq $MaxAttempts) { throw }
+
+            $retryAfter = 0
+            try {
+                $retryAfterDelta = $_.Exception.Response.Headers.RetryAfter.Delta
+                if ($retryAfterDelta) { $retryAfter = [int][math]::Ceiling($retryAfterDelta.TotalSeconds) }
+            } catch { }
+        }
+
+        if ($attempt -eq $MaxAttempts) { return $response }
+        if ($retryAfter -le 0) {
+            $retryAfter = [math]::Min(120, (10 * [math]::Pow(2, $attempt - 1)) + (Get-Random -Minimum 1 -Maximum 6))
+        }
+
+        Write-Status "  Cost Management throttled (429). Automatic retry $($attempt + 1)/$MaxAttempts in $retryAfter seconds..." "WARN"
+        Start-Sleep -Seconds $retryAfter
+    }
+}
+
 # Compatibility alias
 New-Alias -Name 'Safe-AzCommand' -Value 'Invoke-AzCommandSafely' -Scope Script -Force
 
@@ -427,7 +476,7 @@ function Test-PreFlightPermissions {
             dataSet = @{ granularity = "None"; aggregation = @{ totalCost = @{ name = "Cost"; function = "Sum" } } }
             timeframe = "MonthToDate"
         } | ConvertTo-Json -Depth 10
-        $costResp = Invoke-AzRestMethod -Path "/subscriptions/$testSubId/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Method POST -Payload $costBody -ErrorAction Stop
+        $costResp = Invoke-CostManagementQuery -Path "/subscriptions/$testSubId/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Payload $costBody
         if ($costResp.StatusCode -eq 200) {
             $costOk = $true
             Add-CheckResult "Cost Management Reader" "Subscription" "PASS" "Can query cost data"
@@ -638,12 +687,19 @@ function Initialize-Assessment {
         Write-Status "Installing Az.ResourceGraph for optimized inventory..." "INFO"
         Install-Module -Name Az.ResourceGraph -Scope CurrentUser -Force -Repository PSGallery -ErrorAction SilentlyContinue
     }
-    # Login
-    if (-not $SkipLogin) {
+    # Cloud Shell is already authenticated; starting another login can create a duplicate session.
+    $existingContext = Get-AzContext -ErrorAction SilentlyContinue
+    $reuseCloudShellSession = $isCloudShell -and $existingContext -and $existingContext.Account -and $existingContext.Tenant
+    if ($SkipLogin -or $reuseCloudShellSession) {
+        if ($reuseCloudShellSession) {
+            Write-Status "Cloud Shell Azure session detected — reusing existing authentication." "OK"
+        } else {
+            Write-Status "Skipping login (using existing session)..." "INFO"
+        }
+    } else {
         Write-Status "Starting Azure authentication..." "INFO"
         Write-Host ""
         Write-Host "  A browser window will open for authentication." -ForegroundColor Yellow
-        Write-Host "  If using Cloud Shell, you are already authenticated (use -SkipLogin)." -ForegroundColor Yellow
         Write-Host ""
         try {
             Connect-AzAccount -ErrorAction Stop | Out-Null
@@ -657,8 +713,6 @@ function Initialize-Assessment {
             Write-Host "  3. Use: ./Azure-Tenant-Assessment.ps1 -SkipLogin (if already authenticated)" -ForegroundColor Yellow
             throw "Azure authentication error. Verify credentials and connectivity."
         }
-    } else {
-        Write-Status "Skipping login (using existing session)..." "INFO"
     }
 
     # ── Auto-connect Microsoft Graph for CA/PIM checks ──
@@ -956,7 +1010,7 @@ function Get-SubscriptionCostAnalysis {
     } | ConvertTo-Json -Depth 10
 
     try {
-        $response = Invoke-AzRestMethod -Path "/subscriptions/$SubId/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Method POST -Payload $body -ErrorAction Stop
+        $response = Invoke-CostManagementQuery -Path "/subscriptions/$SubId/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Payload $body
 
         if ($response.StatusCode -eq 200) {
             $result = $response.Content | ConvertFrom-Json
@@ -5537,7 +5591,7 @@ resources
             }
             timeframe = "MonthToDate"
         } | ConvertTo-Json -Depth 10
-        $costResp = Invoke-AzRestMethod -Path "/subscriptions/$SubId/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Method POST -Payload $mpCostBody -ErrorAction Stop
+        $costResp = Invoke-CostManagementQuery -Path "/subscriptions/$SubId/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Payload $mpCostBody
         if ($costResp.StatusCode -eq 200) {
             $costData = ($costResp.Content | ConvertFrom-Json).properties
             if ($costData.rows -and $costData.rows.Count -gt 0) {
@@ -5587,7 +5641,7 @@ resources
             timePeriod = @{ from = $startDate; to = $endDate }
         } | ConvertTo-Json -Depth 10
 
-        $monthlyResp = Invoke-AzRestMethod -Path "/subscriptions/$SubId/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Method POST -Payload $mpMonthlyBody -ErrorAction Stop
+        $monthlyResp = Invoke-CostManagementQuery -Path "/subscriptions/$SubId/providers/Microsoft.CostManagement/query?api-version=2023-11-01" -Payload $mpMonthlyBody
         if ($monthlyResp.StatusCode -eq 200) {
             $monthlyResult = ($monthlyResp.Content | ConvertFrom-Json).properties
             $mRows = $monthlyResult.rows
@@ -14853,8 +14907,8 @@ try {
 # SIG # Begin signature block
 # MIIcEQYJKoZIhvcNAQcCoIIcAjCCG/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCdBiv7QdumtzE5
-# fBygmt/VXwrzJXkUdaZp6y/2FTDel6CCFlQwggMWMIIB/qADAgECAhB05LE1IRL+
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCl+Gl+FdjIjZfb
+# daVMKNu++BisOZppmEBbz4dTDtY8P6CCFlQwggMWMIIB/qADAgECAhB05LE1IRL+
 # rkeuEM34A+X/MA0GCSqGSIb3DQEBCwUAMCMxITAfBgNVBAMMGFBhYmxvQVIgQXp1
 # cmUgQXNzZXNzbWVudDAeFw0yNjA1MjMwMTM5MDdaFw0zMTA1MjMwMTQ5MDRaMCMx
 # ITAfBgNVBAMMGFBhYmxvQVIgQXp1cmUgQXNzZXNzbWVudDCCASIwDQYJKoZIhvcN
@@ -14977,28 +15031,28 @@ try {
 # HwYDVQQDDBhQYWJsb0FSIEF6dXJlIEFzc2Vzc21lbnQCEHTksTUhEv6uR64QzfgD
 # 5f8wDQYJYIZIAWUDBAIBBQCggYQwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKAADAZ
 # BgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYKKwYB
-# BAGCNwIBFTAvBgkqhkiG9w0BCQQxIgQg8+qxdrlpbcUzD+74NdsU0PUutGEfW8j3
-# ufaC3qZj7MowDQYJKoZIhvcNAQEBBQAEggEANJVS9clzJXQTytPonAqZvjE0mF3o
-# Eg/x9LuehBH+43fC5C+7RIrAkqfrb2g6mDV7awj5xuAnAlWht0KIDgUBUabi9sZL
-# 8m29poc/U+e+wrP4GqFkl8dMytRP7169ZW5BW+Lge717Ouz7yZxEsbdpqO3HmWDr
-# AzhUQnmrzw2ufVQMcqdz5zOuDQpnV6aks37zqHvYDEaczYOCIbD3wcHKXKjyH85/
-# g1EI43BUV28arZ8cqQSPP7QKliKkGdIkLzXGKuug2yvkcBcI0rVKnegmjVaProRq
-# 01c2fwvQoLPrTVCk9XvVveeTcJK7CFL4hXKsPxDDpjpCiKQqu6FeNkbHcKGCAyYw
+# BAGCNwIBFTAvBgkqhkiG9w0BCQQxIgQgh7zGxwVbeZe1ES7D1pjnkr9lYFNRu+PI
+# dGSj1MjmFlcwDQYJKoZIhvcNAQEBBQAEggEAQBPvRDKmMkxQ2+mP0SxRg51Is1Dx
+# JtCCLaZSu4ukw+BWE/D51QQEGoeDwyfV+KJ8JG9+a48IWXu5/yRNxLezu3liUWRe
+# jgyI7yushEAIBhdM3RGgihct0CdV+Wh59E9gqhMV79y+yD2/LRiqp+j81CHlWeKu
+# EQ3MoT+RkPFx6J0ekPonp5opbkPcqfTYXCS4259AxDxONU5eL6koVe0CdIvhv8Db
+# W7Uhkx/L9PaGsg6ZvHNIDMADUVFnEeIA36lhAYjKfAN1JsYK+OodB7q0R/aVJ4T6
+# 00UAOByHxXt6NGzOWpviYSGGgEdTDT4tNM4Jq0Aqrpb1wgdSuS/zlaN5WaGCAyYw
 # ggMiBgkqhkiG9w0BCQYxggMTMIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYD
 # VQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBH
 # NCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO
 # 28MPj/mSGDUwDQYJYIZIAWUDBAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcN
-# AQcBMBwGCSqGSIb3DQEJBTEPFw0yNjA5MDkxMzI3MTVaMC8GCSqGSIb3DQEJBDEi
-# BCAHn7ZPWpuGOzkbnrSRU9Xd/1q+qckPmfNuB1k1CHOBlzANBgkqhkiG9w0BAQEF
-# AASCAgASDqS/SusJ1PI4RbSeasVL6s8mdVU3ZUfnPxJ9fjhZLrTuczqFZcdEvnFB
-# O6VV4ZffOMx2JdRv2IBtB6nC3e6awq9zOtNWDQqDE3cm4XERPJsk09nn51KPQkL2
-# 7gpLpRanN9Z2GzgkOK7hPvv8uMbyP97OjIvtpke0fjAx8hJntxuW4Yh7RT1Kjka5
-# fhDDtuBtyFvu7lGBcBb1pVGNs7N1bzwLdwZ5o1t6qf4BS9NnBqwGxR5lVeP1/xvN
-# EUBThnPq6DClxRcR6pSpLJuCiqYyyOw2ExJFyf9sA/ZFOVdFzFjIWvIOCHXGNaN6
-# HiPxvbRpScFRh+3CWFSzQZ+b1NlWHAij8YP7z75qypqUzS0ax/igNV8GGlvxu1Rw
-# QDD7MBBaTp2SRW/gX6MsTHo4Wgl/0FGf971hTQgnbIepv4a/ZRV/GU3iEgntKLMH
-# mZlyRECQXC4W19Mc7sTEkZDusM3UwErXVVz4nWkO+RHxRtP/dqK8W9/7HiSN932E
-# M9Mt9O5quKxJSgzuQUpUNQQmRZgPTDgIMTSXNtwf06yiKLv1BHTEhHGZ195A7BDV
-# IFB7LJs+p3H67t6aO8B1kuorKYtrp4UhL0ifY/SvKldaAQMh0R1FTUQRlgeMnY4Q
-# maDVouQiCYcs+w8Ftn0xATEAFyn/avBohuNBW7pmbpvGhQzGEg==
+# AQcBMBwGCSqGSIb3DQEJBTEPFw0yNjA5MDkxNDE2MThaMC8GCSqGSIb3DQEJBDEi
+# BCAT46u6Sf34xx5SinW78O7bRPaIUBJAeXqaLyjRQ3zOUDANBgkqhkiG9w0BAQEF
+# AASCAgBTFz5xLsvsESf9+mggT0iEIqmNuqRHk5KjFpTcIzlV+BzRWx2hz+XLxa+K
+# wzHj7vsQo4MAFWom7eR8RVScygjnnmW75hgUEzxfBnI8Wb3qNgmhU+c2YwGWicHZ
+# q3hCi6CoY7BgYgxX/Zqi5UQNQbrXVATYOBM555N9UfEU/ZCxkTkl90+QeEJYeOVH
+# BceziXrXIZ0EDFtvWALI9UPEz5n8hFcyKI8ZUG/dDDgaQvY+m1CGfSVI6cciDjCC
+# GRuUOVIWc3UuTVmt3jxRk1w9k7PlRsgX7IoeiDeWHTKI58tGe+UYkXO/uBIKpdlM
+# rHca52bwI8f/1AIY/mf2ixlJLA9BBTj4Mg2JTfEa7KjUXiGjQO7qdhVgsGINi2fN
+# lYxCDs4kE9QHHqMkgMmcYd5wBzxjZpr/jof1anpm3OM7wrz1Par+8j7i8XUdYUPB
+# jy3ZeEj68nIIZ36Uv4Dw8woZextdSLNxvV5F6fD4aC+cI2CjhoxcD3YF39g9PREY
+# qGm7GH/32/z1GXgpiMPGJs/8kdbI5/PQPxxNNy/lzUAmIWCfUQz0WHsu1YKx/GhP
+# b0B2F6/WOj4YNQNGP4WDnoU5BUdN/UzXKfi1KLzF6rJOxFm0DiKtFekT9Dp3Sxp8
+# KTEWB1IkQHR4sWFpO4bzGniUCipvvxBiRIpy6W/TFwCQYZkKjg==
 # SIG # End signature block
