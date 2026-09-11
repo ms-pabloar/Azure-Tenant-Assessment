@@ -10,6 +10,7 @@ $functionNames = @(
     'Get-PercentileValue',
     'ConvertFrom-AzureReservationRecommendation',
     'ConvertFrom-AzureSavingsPlanRecommendation',
+    'ConvertFrom-ReservationUtilizationSummary',
     'Resolve-CommitmentRecommendationDecision'
 )
 foreach ($functionName in $functionNames) {
@@ -72,6 +73,25 @@ Describe 'Reservation recommendations' {
         $result.SavingsCurrency | Should Be 'USD'
         $result.DecisionStatus | Should Be 'Review first'
     }
+
+    It 'caps impossible savings percentages and requires source-cost review' {
+        Reset-CommitmentTestState
+        $inputObject = [pscustomobject]@{
+            id = '/recommendations/ri-invalid'; location = 'eastus'; sku = 'Standard_D4s_v5'
+            properties = [pscustomobject]@{
+                lookBackPeriod = 'Last30Days'; costWithNoReservedInstances = 100
+                totalCostWithReservedInstances = 50; netSavings = 150
+                recommendedQuantity = 1; totalHours = 720; term = 'P1Y'; scope = 'Single'
+            }
+        }
+
+        $result = ConvertFrom-AzureReservationRecommendation $inputObject 'sub-1' 'Sub A'
+
+        $result.SavingsPercentage | Should Be 100
+        $result.IsSavingsEstimateValid | Should Be $false
+        $result.DecisionStatus | Should Be 'Review first'
+        $result.DecisionReason | Should Match 'inconsistent savings estimate'
+    }
 }
 
 Describe 'Savings Plan recommendations' {
@@ -121,6 +141,37 @@ Describe 'Savings Plan recommendations' {
     }
 }
 
+Describe 'Existing reservation utilization' {
+    It 'calculates weighted utilization and unused reserved hours' {
+        $dailySummaries = @(
+            [pscustomobject]@{ properties = [pscustomobject]@{ usageDate = '2026-09-01'; reservedHours = 24; usedHours = 18; avgUtilizationPercentage = 75 } }
+            [pscustomobject]@{ properties = [pscustomobject]@{ usageDate = '2026-09-02'; reservedHours = 48; usedHours = 24; avgUtilizationPercentage = 50 } }
+        )
+
+        $result = ConvertFrom-ReservationUtilizationSummary -InputObject $dailySummaries -WindowDays 30
+
+        $result.ReservedHours | Should Be 72
+        $result.UsedHours | Should Be 42
+        $result.UnusedHours | Should Be 30
+        $result.UtilizationPct | Should Be 58.3
+        $result.UnusedCommitmentPercentage | Should Be 41.7
+        $result.MeasuredDays | Should Be 2
+    }
+
+    It 'uses reported utilization when hour totals are unavailable' {
+        $summaries = @(
+            [pscustomobject]@{ properties = [pscustomobject]@{ avgUtilizationPercentage = 80 } }
+            [pscustomobject]@{ properties = [pscustomobject]@{ utilizedPercentage = 60 } }
+        )
+
+        $result = ConvertFrom-ReservationUtilizationSummary -InputObject $summaries
+
+        $result.UtilizationPct | Should Be 70
+        $result.UnusedCommitmentPercentage | Should Be 30
+        $result.ReservedHours | Should BeNullOrEmpty
+    }
+}
+
 Describe 'Commitment option selection' {
     It 'selects one preferred option and marks overlapping candidates as alternatives' {
         Reset-CommitmentTestState
@@ -160,5 +211,23 @@ Describe 'Native recommendation configuration' {
         $text | Should Match 'Microsoft\.CostManagement/benefitRecommendations'
         $text | Should Match "@\('P1Y', 'P3Y'\)"
         $text | Should Match 'properties/usage,properties/allRecommendationDetails'
+    }
+
+    It 'collects reservation usage hours with a bounded fallback' {
+        $definition = $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Analyze-Reservations'
+        }, $true) | Select-Object -First 1
+        $text = $definition.Extent.Text
+
+        $text | Should Match 'Microsoft\.Consumption/reservationSummaries'
+        $text | Should Match 'grain=daily'
+        $text | Should Match 'properties/UsageDate ge'
+        $text | Should Match 'ConvertFrom-ReservationUtilizationSummary'
+        $text | Should Match '\$expand=utilization'
+        $text | Should Match 'UnusedCommitmentPercentage'
+        $text | Should Match 'Get-AzRestPagedValues -Path "/providers/Microsoft\.Capacity/reservationOrders'
+        $text | Should Match 'Get-AzRestPagedValues -Path "/providers/Microsoft\.BillingBenefits/savingsPlanOrders'
+        $text | Should Match 'Invoke-AzRestMethodWithRetry -Path "\$\(\$ri\.id\)'
     }
 }

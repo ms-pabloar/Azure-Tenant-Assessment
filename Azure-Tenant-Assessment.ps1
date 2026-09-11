@@ -1,5 +1,4 @@
 #Requires -Version 7.0
-#Requires -Modules @{ModuleName='Az.Accounts';ModuleVersion='3.0.0'}
 # ============================================================================
 # CONFIDENTIAL — Microsoft Internal Use Only
 # ============================================================================
@@ -18,7 +17,7 @@
     - Complete inventory of resources, configurations, and detected issues
 .NOTES
     Author: Azure Assessment Tool
-    Version: 5.6
+    Version: 5.7
     Requiere: Az PowerShell Modules (Az.Accounts, Az.Compute, Az.Network, Az.Sql,
               Az.Storage, Az.KeyVault, Az.Monitor, Az.Security, Az.Aks,
               Az.OperationalInsights, Az.RecoveryServices, Az.ResourceGraph)
@@ -54,13 +53,57 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$false)]
-    [string]$SubscriptionId = "",
+    [Alias('SubscriptionIds')]
+    [string[]]$SubscriptionId = @(),
 
     [Parameter(Mandatory=$false)]
     [switch]$SkipLogin,
 
+    [Parameter(Mandatory=$false, HelpMessage="Microsoft Entra tenant ID used for Azure authentication and discovery.")]
+    [string]$TenantId = "",
+
+    [Parameter(Mandatory=$false, HelpMessage="Use device-code authentication instead of opening a local browser.")]
+    [switch]$UseDeviceAuthentication,
+
+    [Parameter(Mandatory=$false, HelpMessage="Do not attempt optional interactive Microsoft Graph authentication.")]
+    [switch]$SkipGraphLogin,
+
     [Parameter(Mandatory=$false)]
     [string]$OutputPath = "./AzureAssessment_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
+
+    [Parameter(Mandatory=$false)]
+    [ValidateRange(1, 1000)]
+    [int]$BatchSize = 20,
+
+    [Parameter(Mandatory=$false)]
+    [ValidateRange(1, 16)]
+    [int]$MaxParallelism = 1,
+
+    [Parameter(Mandatory=$false, HelpMessage="Maximum runtime in minutes for each isolated subscription worker.")]
+    [ValidateRange(5, 1440)]
+    [int]$WorkerTimeoutMinutes = 180,
+
+    [Parameter(Mandatory=$false, HelpMessage="Seconds between progress and ETA updates.")]
+    [ValidateRange(30, 900)]
+    [int]$ProgressIntervalSeconds = 60,
+
+    [Parameter(Mandatory=$false)]
+    [string]$CheckpointPath = "",
+
+    [Parameter(Mandatory=$false)]
+    [switch]$Resume,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$RetryFailedOnly,
+
+    [Parameter(Mandatory=$false, DontShow=$true)]
+    [switch]$WorkerMode,
+
+    [Parameter(Mandatory=$false, DontShow=$true)]
+    [string]$WorkerContextPath = "",
+
+    [Parameter(Mandatory=$false, DontShow=$true)]
+    [string]$WorkerConfigPath = "",
 
     [Parameter(Mandatory=$false)]
     [int]$CpuLowPercent = 10,
@@ -86,6 +129,22 @@ param(
     [Parameter(Mandatory=$false)]
     [switch]$SkipMetrics,
 
+    [Parameter(Mandatory=$false, HelpMessage="Collect Azure AI Foundry and Azure AI Services utilization metrics. Inventory and configuration checks always reuse Resource Graph.")]
+    [switch]$IncludeAIMetrics,
+
+    [Parameter(Mandatory=$false, HelpMessage="GitHub organizations to assess using GITHUB_TOKEN or an existing gh CLI login.")]
+    [string[]]$GitHubOrganization = @(),
+
+    [Parameter(Mandatory=$false, HelpMessage="Collect the latest 28-day GitHub Copilot usage report for each specified GitHub organization.")]
+    [switch]$IncludeGitHubCopilot,
+
+    [Parameter(Mandatory=$false, HelpMessage="Collect aggregate Microsoft 365 Copilot adoption using Microsoft Graph Reports.Read.All.")]
+    [switch]$IncludeM365Copilot,
+
+    [Parameter(Mandatory=$false, HelpMessage="Microsoft 365 Copilot aggregate report period.")]
+    [ValidateSet('D7','D28','D90','D180')]
+    [string]$CopilotUsagePeriod = 'D28',
+
     [Parameter(Mandatory=$false)]
     [switch]$SkipKeyVaultDataPlane,
 
@@ -108,6 +167,15 @@ param(
     [Parameter(Mandatory=$false, HelpMessage="Block execution unless the Authenticode signature is valid and trusted on this computer.")]
     [switch]$RequireValidSignature
 )
+
+$script:OutputPathExplicitlySpecified = $PSBoundParameters.ContainsKey('OutputPath')
+
+if ($WorkerConfigPath) {
+    $workerConfiguration = Get-Content -Path $WorkerConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($property in $workerConfiguration.PSObject.Properties) {
+        Set-Variable -Name $property.Name -Value $property.Value -Scope Script
+    }
+}
 
 # ============================================================================
 # SCRIPT INTEGRITY CHECK
@@ -139,7 +207,11 @@ $script:Resources = [System.Collections.Generic.List[PSCustomObject]]::new()
 $script:NetworkTopology = [System.Collections.Generic.List[PSCustomObject]]::new()
 $script:Subscriptions = [System.Collections.Generic.List[PSCustomObject]]::new()
 $script:UnderutilizedResources = [System.Collections.Generic.List[PSCustomObject]]::new()
+$script:AIServiceInventory = [System.Collections.Generic.List[PSCustomObject]]::new()
+$script:AIUsageData = [System.Collections.Generic.List[PSCustomObject]]::new()
+$script:AdoptionData = [ordered]@{ GitHub = @(); GitHubCopilot = @(); Microsoft365Copilot = $null }
 $script:CostData = @{}  # Key = SubscriptionId, Value = cost analysis object
+$script:MarketplaceCostData = @{} # Key = SubscriptionId, Value = Marketplace cost analysis object
 $script:Summary = @{
     TotalResources = 0
     Critical = 0
@@ -169,6 +241,10 @@ $script:CachedLoadBalancers = $null
 $script:CachedAppGateways = $null
 $script:CachedFirewalls = $null
 $script:CachedBastions = $null
+$script:CachedResourceGroups = $null
+$script:CachedResourceTypeCounts = $null # Null means Resource Graph inventory is unavailable; do not skip queries
+$script:CachedResourceGraphResources = $null
+$script:CachedResourcesByType = $null
 $script:CachedWebAppDetails = @{}        # Detailed App Service configs (pre-cached)
 $script:CachedVMEncryption = @{}         # VM disk encryption status (pre-cached)
 $script:CachedVMExtensions = @{}        # VM extensions by type (pre-cached via Resource Graph)
@@ -177,6 +253,7 @@ $script:CachedKVKeys = @{}              # Key Vault keys expiration (pre-cached 
 $script:CachedKVCerts = @{}             # Key Vault certificates expiration (pre-cached via Resource Graph)
 $script:CachedBackupItems = @{}         # Recovery Services backup items (pre-cached via Resource Graph)
 $script:CachedBackupPolicies = @{}      # Recovery Services backup policies (pre-cached via Resource Graph)
+$script:CachedAutoShutdownAvailable = $false
 $script:ZeroTrustTenantAdvisoryEmitted = $false  # Emit CA/PIM advisory only once per tenant
 $script:KeepAliveTimer = $null          # Cloud Shell keep-alive timer
 $script:ALZData = @{}                   # ALZ readiness data (MG hierarchy, policy, vWAN, DNS, Graph)
@@ -190,6 +267,10 @@ function Clear-SubscriptionCaches {
     $script:CachedPublicIPs = $null; $script:CachedPrivateEndpoints = $null
     $script:CachedLoadBalancers = $null; $script:CachedAppGateways = $null
     $script:CachedFirewalls = $null; $script:CachedBastions = $null
+    $script:CachedResourceGroups = $null
+    $script:CachedResourceTypeCounts = $null
+    $script:CachedResourceGraphResources = $null
+    $script:CachedResourcesByType = $null
     $script:CachedWebAppDetails = @{}; $script:CachedVMEncryption = @{}
     $script:CachedVMExtensions = @{}
     $script:CachedRecoveryVaults = $null  # Per-sub vault list, set by Analyze-BCDR
@@ -197,8 +278,57 @@ function Clear-SubscriptionCaches {
     # they are pre-populated for ALL subs before the main loop and keyed by subscriptionId
     $script:DataCollectionSucceeded = $false
 }
+
+function Test-CachedResourceType {
+    param([Parameter(Mandatory=$true)][string[]]$ResourceType)
+
+    if ($null -eq $script:CachedResourceTypeCounts) { return $true }
+    foreach ($typeName in $ResourceType) {
+        if ($script:CachedResourceTypeCounts.ContainsKey($typeName.ToLowerInvariant())) { return $true }
+    }
+    return $false
+}
+
+function Invoke-AzCollectionWhenResourceTypeExists {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$ResourceType,
+        [Parameter(Mandatory=$true)][scriptblock]$Command,
+        [Parameter(Mandatory=$true)][string]$ErrorMessage
+    )
+
+    if (-not (Test-CachedResourceType -ResourceType $ResourceType)) { return @() }
+    return @(Invoke-AzCommandSafely -Command $Command -ErrorMessage $ErrorMessage)
+}
+
+function Get-CachedResourceGraphResourcesByType {
+    param([Parameter(Mandatory=$true)][string]$ResourceType)
+
+    if ($null -eq $script:CachedResourcesByType) { return @() }
+    $resourceTypeKey = $ResourceType.ToLowerInvariant()
+    if (-not $script:CachedResourcesByType.ContainsKey($resourceTypeKey)) { return @() }
+    return @($script:CachedResourcesByType[$resourceTypeKey])
+}
+
+function Get-CachedResourceDetailsByType {
+    param([Parameter(Mandatory=$true)][string]$ResourceType)
+
+    if ($null -ne $script:CachedResourcesByType) {
+        $resources = @(Get-CachedResourceGraphResourcesByType -ResourceType $ResourceType)
+        foreach ($resource in $resources) {
+            if (-not $resource.PSObject.Properties['ResourceId']) {
+                $resource | Add-Member -NotePropertyName ResourceId -NotePropertyValue $resource.id
+            }
+            if (-not $resource.PSObject.Properties['ResourceGroupName']) {
+                $resource | Add-Member -NotePropertyName ResourceGroupName -NotePropertyValue $resource.resourceGroup
+            }
+        }
+        return $resources
+    }
+    return @(Invoke-AzCommandSafely { Get-AzResource -ResourceType $ResourceType -ExpandProperties -ErrorAction SilentlyContinue } "Error retrieving $ResourceType resources")
+}
 $script:PreFlightResults = [System.Collections.Generic.List[PSCustomObject]]::new()  # Permission check results
 $script:ReservationData = [System.Collections.Generic.List[PSCustomObject]]::new()   # Reservation & Savings Plan inventory
+$script:ReservationInventoryLoaded = $false # Tenant-wide APIs must run once even when they return no benefits
 $script:CommitmentRecommendations = [System.Collections.Generic.List[PSCustomObject]]::new() # Advisor-backed purchase candidates
 
 # ============================================================================
@@ -212,22 +342,72 @@ $script:CommitmentRecommendations = [System.Collections.Generic.List[PSCustomObj
 
 $script:LastKeepAlive = [datetime]::MinValue
 $script:LastTokenRefresh = [datetime]::MinValue
+$script:LastPartialReportAt = [datetime]::MinValue
+$script:ExecutionProgress = [hashtable]::Synchronized(@{
+    Total = 0
+    Completed = 0
+    StartedAt = $null
+})
+
+function Get-ExecutionProgressMessage {
+    param(
+        [Parameter(Mandatory=$true)][System.Collections.IDictionary]$ProgressState,
+        [datetime]$Now = (Get-Date)
+    )
+
+    $total = [int]$ProgressState.Total
+    $completed = [int]$ProgressState.Completed
+    if ($total -le 0 -or $null -eq $ProgressState.StartedAt) {
+        return "[progress] Initializing assessment..."
+    }
+
+    $elapsed = $Now - [datetime]$ProgressState.StartedAt
+    $elapsedText = if ($elapsed.TotalHours -ge 1) { '{0:0}h {1:00}m' -f [math]::Floor($elapsed.TotalHours), $elapsed.Minutes } else { '{0:0}m {1:00}s' -f [math]::Floor($elapsed.TotalMinutes), $elapsed.Seconds }
+    $percent = [math]::Round(([math]::Min($completed, $total) / $total) * 100, 1)
+    if ($completed -le 0) {
+        return "[progress] 0/$total subscriptions (0%) | elapsed $elapsedText | ETA calculating..."
+    }
+
+    $remaining = [math]::Max(0, $total - $completed)
+    $remainingSeconds = ($elapsed.TotalSeconds / $completed) * $remaining
+    $remainingSpan = [timespan]::FromSeconds($remainingSeconds)
+    $remainingText = if ($remainingSpan.TotalHours -ge 1) { '{0:0}h {1:00}m' -f [math]::Floor($remainingSpan.TotalHours), $remainingSpan.Minutes } else { '{0:0}m {1:00}s' -f [math]::Floor($remainingSpan.TotalMinutes), $remainingSpan.Seconds }
+    $finishTime = $Now.AddSeconds($remainingSeconds).ToString('HH:mm')
+    return "[progress] $completed/$total subscriptions ($percent%) | elapsed $elapsedText | remaining ~$remainingText | estimated finish $finishTime"
+}
+
+function Initialize-ExecutionProgress {
+    param([Parameter(Mandatory=$true)][int]$Total)
+    $script:ExecutionProgress.Total = $Total
+    $script:ExecutionProgress.Completed = 0
+    $script:ExecutionProgress.StartedAt = Get-Date
+}
+
+function Complete-ExecutionProgressUnit {
+    if ($script:ExecutionProgress.Completed -lt $script:ExecutionProgress.Total) {
+        $script:ExecutionProgress.Completed++
+    }
+    Write-Host "  $(Get-ExecutionProgressMessage -ProgressState $script:ExecutionProgress)" -ForegroundColor DarkGray
+}
 
 function Start-KeepAlive {
     if ($script:KeepAliveTimer) { return }
     $script:LastKeepAlive = Get-Date
     $script:LastTokenRefresh = Get-Date
-    $script:KeepAliveTimer = [System.Timers.Timer]::new(30000)  # 30 seconds (more aggressive)
+    $script:KeepAliveTimer = [System.Timers.Timer]::new($ProgressIntervalSeconds * 1000)
+    $progressContext = [PSCustomObject]@{
+        State = $script:ExecutionProgress
+        Formatter = ${function:Get-ExecutionProgressMessage}
+    }
     $action = {
         try {
-            $elapsed = [math]::Round(((Get-Date) - $script:StartTime).TotalMinutes, 1)
+            $msg = & $event.MessageData.Formatter -ProgressState $event.MessageData.State
             # Write to both Console and Host to maximize chance of reaching websocket
-            $msg = "  [keepalive] $elapsed min elapsed"
-            [Console]::WriteLine($msg)
-            Write-Host $msg -ForegroundColor DarkGray
+            [Console]::WriteLine("  $msg")
+            Write-Host "  $msg" -ForegroundColor DarkGray
         } catch { }
     }
-    Register-ObjectEvent -InputObject $script:KeepAliveTimer -EventName Elapsed -Action $action -SourceIdentifier 'KeepAlive' | Out-Null
+    Register-ObjectEvent -InputObject $script:KeepAliveTimer -EventName Elapsed -Action $action -MessageData $progressContext -SourceIdentifier 'KeepAlive' | Out-Null
     $script:KeepAliveTimer.AutoReset = $true
     $script:KeepAliveTimer.Start()
 }
@@ -246,10 +426,9 @@ function Stop-KeepAlive {
 # Also refreshes Azure token every 15 minutes to prevent expiration.
 function Send-KeepAlive {
     $now = Get-Date
-    # Console output every 30 seconds to keep websocket alive
-    if (($now - $script:LastKeepAlive).TotalSeconds -ge 30) {
-        $elapsed = [math]::Round(($now - $script:StartTime).TotalMinutes, 1)
-        Write-Host "  [keepalive] $elapsed min — session active" -ForegroundColor DarkGray
+    if (($now - $script:LastKeepAlive).TotalSeconds -ge $ProgressIntervalSeconds) {
+        $progressMessage = Get-ExecutionProgressMessage -ProgressState $script:ExecutionProgress -Now $now
+        Write-Host "  $progressMessage" -ForegroundColor DarkGray
         $script:LastKeepAlive = $now
     }
     # Refresh Azure token every 15 minutes (tokens expire at ~60 min)
@@ -319,6 +498,28 @@ function Invoke-AnalysisStep {
     }
 }
 
+function Invoke-AnalysisStepForResourceTypes {
+    param(
+        [string]$StepName,
+        [string]$SubId,
+        [string]$SubName,
+        [Parameter(Mandatory=$true)][string[]]$ResourceType,
+        [scriptblock]$Action
+    )
+
+    if (-not (Test-CachedResourceType -ResourceType $ResourceType)) {
+        $script:StepResults.Add([PSCustomObject]@{
+            Step         = $StepName
+            Subscription = $SubName
+            Status       = 'SKIPPED'
+            DurationSec  = 0
+            Error        = 'No applicable resources'
+        })
+        return
+    }
+    Invoke-AnalysisStep -StepName $StepName -SubId $SubId -SubName $SubName -Action $Action
+}
+
 function ConvertTo-SafeHtml {
     param([string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return '' }
@@ -369,6 +570,16 @@ function Get-FirstPropertyValue {
         if ($null -ne $value -and "$value" -ne '') { return $value }
     }
     return $null
+}
+
+function Test-ObjectProperty {
+    param([object]$InputObject, [string]$Name)
+
+    if ($null -eq $InputObject) { return $false }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        return $InputObject.Contains($Name)
+    }
+    return $null -ne $InputObject.PSObject.Properties[$Name]
 }
 
 function ConvertTo-CommitmentRecommendation {
@@ -461,16 +672,19 @@ function Get-PercentileValue {
 function Invoke-AzRestMethodWithRetry {
     param(
         [Parameter(Mandatory=$true)][string]$Path,
+        [ValidateSet('GET', 'POST')][string]$Method = 'GET',
+        [AllowNull()][object]$Payload = $null,
         [ValidateRange(1, 10)][int]$MaxAttempts = 6
     )
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         Send-KeepAlive
         try {
-            $invokeParameters = @{ Method = 'GET'; ErrorAction = 'Stop' }
+            $invokeParameters = @{ Method = $Method; ErrorAction = 'Stop' }
             if ($Path -match '^https?://') { $invokeParameters.Uri = $Path } else { $invokeParameters.Path = $Path }
+            if ($null -ne $Payload) { $invokeParameters.Payload = $Payload }
             $response = Invoke-AzRestMethod @invokeParameters
-            if ($response.StatusCode -notin @(429, 503)) { return $response }
+            if ($response.StatusCode -notin @(408, 429, 500, 502, 503, 504)) { return $response }
 
             $retryAfter = 0
             if ($response.Headers) {
@@ -480,7 +694,7 @@ function Invoke-AzRestMethodWithRetry {
                 }
             }
         } catch {
-            $isTransient = $_.Exception.Message -match '429|503|Too Many Requests|Service Unavailable'
+            $isTransient = $_.Exception.Message -match '408|429|500|502|503|504|Too Many Requests|Service Unavailable|timeout|temporar'
             if (-not $isTransient -or $attempt -eq $MaxAttempts) { throw }
             $retryAfter = 0
             try {
@@ -521,7 +735,9 @@ function ConvertFrom-AzureReservationRecommendation {
     $benefitCost = ConvertTo-AmountValue $properties.totalCostWithReservedInstances
     $savingsAmount = ConvertTo-AmountValue $properties.netSavings
     $currency = if ($properties.netSavings.PSObject.Properties['currency']) { $properties.netSavings.currency } elseif ($properties.costWithNoReservedInstances.PSObject.Properties['currency']) { $properties.costWithNoReservedInstances.currency } else { 'N/A' }
-    $savingsPercentage = if ($paygCost -gt 0 -and $null -ne $savingsAmount) { [math]::Round(($savingsAmount / $paygCost) * 100, 1) } else { $null }
+    $rawSavingsPercentage = if ($paygCost -gt 0 -and $null -ne $savingsAmount) { [math]::Round(($savingsAmount / $paygCost) * 100, 1) } else { $null }
+    $isSavingsEstimateValid = $null -ne $rawSavingsPercentage -and $rawSavingsPercentage -ge 0 -and $rawSavingsPercentage -le 100
+    $savingsPercentage = if ($null -ne $rawSavingsPercentage) { [math]::Max(0, [math]::Min(100, $rawSavingsPercentage)) } else { $null }
     $annualSavings = if ($lookbackDays -gt 0 -and $null -ne $savingsAmount) { [math]::Round(($savingsAmount / $lookbackDays) * 365, 2) } else { $null }
     $sku = if ($InputObject.sku) { $InputObject.sku } elseif ($properties.skuName) { $properties.skuName } else { $properties.normalizedSize }
     $possibleHours = $lookbackDays * 24 * [double]$properties.recommendedQuantity
@@ -529,7 +745,7 @@ function ConvertFrom-AzureReservationRecommendation {
     $underutilizedMatch = $script:UnderutilizedResources | Where-Object {
         $_.Subscription -eq $SubName -and $_.ResourceType -match 'Virtual Machine' -and $_.SKU -eq $sku
     } | Select-Object -First 1
-    $isCandidate = $properties.recommendedQuantity -gt 0 -and $savingsPercentage -ge 5 -and $projectedUtilization -ge 80 -and -not $underutilizedMatch
+    $isCandidate = $isSavingsEstimateValid -and $properties.recommendedQuantity -gt 0 -and $savingsPercentage -ge 5 -and $projectedUtilization -ge 80 -and -not $underutilizedMatch
 
     return [PSCustomObject]@{
         Type                    = 'Reservation'
@@ -556,13 +772,14 @@ function ConvertFrom-AzureReservationRecommendation {
         AnnualSavings           = $annualSavings
         SavingsCurrency         = $currency
         SavingsPercentage       = $savingsPercentage
+        IsSavingsEstimateValid  = $isSavingsEstimateValid
         CoveragePercentage      = $projectedUtilization
         UtilizationPercentage   = $projectedUtilization
         WastageCost             = $null
         BreakEven               = if ($savingsAmount -gt 0) { "Net-positive in ${lookbackDays}-day Azure simulation" } else { 'Not reached' }
         ExistingBenefitsIncluded = $true
         DecisionStatus          = if ($isCandidate) { 'Candidate' } else { 'Review first' }
-        DecisionReason          = if ($underutilizedMatch) { 'Rightsize matching underutilized VMs before reserving this SKU.' } elseif ($savingsPercentage -lt 5) { 'Projected savings are below the conservative 5% threshold.' } elseif ($projectedUtilization -lt 80) { 'Projected reservation utilization is below 80%.' } else { 'Azure-calculated SKU and regional reservation candidate.' }
+        DecisionReason          = if (-not $isSavingsEstimateValid) { 'Azure returned an inconsistent savings estimate; verify source costs before purchase.' } elseif ($underutilizedMatch) { 'Rightsize matching underutilized VMs before reserving this SKU.' } elseif ($savingsPercentage -lt 5) { 'Projected savings are below the conservative 5% threshold.' } elseif ($projectedUtilization -lt 80) { 'Projected reservation utilization is below 80%.' } else { 'Azure-calculated SKU and regional reservation candidate.' }
         Recommendation          = "Evaluate quantity $($properties.recommendedQuantity) for $sku in $($properties.term); validate workload continuity before purchase."
         AdvisorId               = $InputObject.id
     }
@@ -618,6 +835,62 @@ function ConvertFrom-AzureSavingsPlanRecommendation {
         DecisionReason          = if ($details.savingsPercentage -lt 5) { 'Projected savings are below the conservative 5% threshold.' } elseif ($details.averageUtilizationPercentage -lt 90) { 'Projected commitment utilization is below 90%.' } elseif ($details.wastageCost -gt $wastageThreshold) { 'Projected commitment wastage exceeds the conservative threshold.' } else { 'Azure-calculated scope recommendation using hourly eligible compute charges.' }
         Recommendation          = "Evaluate an hourly commitment of $($details.commitmentAmount) $($properties.currencyCode) for $($properties.term); validate scope and recent workload changes before purchase."
         AdvisorId               = $InputObject.id
+    }
+}
+
+function ConvertFrom-ReservationUtilizationSummary {
+    param(
+        [object[]]$InputObject,
+        [ValidateRange(1, 365)][int]$WindowDays = 30
+    )
+
+    $reservedHours = 0.0
+    $usedHours = 0.0
+    $hourDataPoints = 0
+    $reportedPercentages = [System.Collections.Generic.List[double]]::new()
+    $usageDates = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($item in @($InputObject)) {
+        if ($null -eq $item) { continue }
+        $properties = if ($item.PSObject.Properties['properties']) { $item.properties } else { $item }
+        if ($null -eq $properties) { continue }
+
+        $reserved = ConvertTo-AmountValue $properties.reservedHours
+        $used = ConvertTo-AmountValue $properties.usedHours
+        if ($null -ne $reserved -and $null -ne $used) {
+            $reservedHours += [double]$reserved
+            $usedHours += [double]$used
+            $hourDataPoints++
+        }
+
+        foreach ($propertyName in @('avgUtilizationPercentage', 'utilizedPercentage', 'utilizationPercentage')) {
+            if ($properties.PSObject.Properties[$propertyName] -and $null -ne $properties.$propertyName) {
+                $reportedPercentages.Add([double]$properties.$propertyName)
+                break
+            }
+        }
+        if ($properties.PSObject.Properties['usageDate'] -and $properties.usageDate) {
+            [void]$usageDates.Add(([string]$properties.usageDate).Substring(0, [math]::Min(10, ([string]$properties.usageDate).Length)))
+        }
+    }
+
+    $utilizationPct = if ($hourDataPoints -gt 0 -and $reservedHours -gt 0) {
+        $rawUtilization = [math]::Min(100.0, ($usedHours / $reservedHours) * 100.0)
+        [math]::Round([double]$rawUtilization, [int]1)
+    } elseif ($reportedPercentages.Count -gt 0) {
+        [math]::Round([double](($reportedPercentages | Measure-Object -Average).Average), [int]1)
+    } else { $null }
+    $unusedHours = if ($hourDataPoints -gt 0) { [math]::Round([math]::Max(0, $reservedHours - $usedHours), 2) } else { $null }
+
+    return [PSCustomObject]@{
+        WindowDays                  = $WindowDays
+        DataPoints                  = [math]::Max($hourDataPoints, $reportedPercentages.Count)
+        MeasuredDays                = $usageDates.Count
+        ReservedHours               = if ($hourDataPoints -gt 0) { [math]::Round($reservedHours, 2) } else { $null }
+        UsedHours                   = if ($hourDataPoints -gt 0) { [math]::Round($usedHours, 2) } else { $null }
+        UnusedHours                 = $unusedHours
+        UtilizationPct              = $utilizationPct
+        UnusedCommitmentPercentage = if ($null -ne $utilizationPct) { [math]::Round([double][math]::Max(0.0, 100.0 - $utilizationPct), [int]1) } else { $null }
     }
 }
 
@@ -1014,12 +1287,19 @@ function Initialize-Assessment {
         Write-Status "Running inside tmux — session is protected from disconnection" "OK"
     }
 
-    # Verify Az module
+    # Verify the complete Az rollup. This runs at runtime so a clean laptop can bootstrap itself.
     Write-Status "Verifying Az PowerShell module..." "INFO"
-    if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
+    $azAccountsModule = Get-Module -ListAvailable -Name Az.Accounts | Where-Object { $_.Version -ge [version]'3.0.0' } | Select-Object -First 1
+    $azRollupModule = Get-Module -ListAvailable -Name Az | Select-Object -First 1
+    if (-not $azAccountsModule -or -not $azRollupModule) {
         Write-Status "Installing Az module (this may take a few minutes)..." "WARN"
-        Install-Module -Name Az -Scope CurrentUser -Force -AllowClobber -Repository PSGallery -MinimumVersion 12.0.0
+        try {
+            Install-Module -Name Az -Scope CurrentUser -Force -AllowClobber -Repository PSGallery -MinimumVersion 12.0.0 -ErrorAction Stop
+        } catch {
+            throw "Az PowerShell 12.0.0+ is required. Automatic installation failed: $($_.Exception.Message). Install it with: Install-Module Az -Scope CurrentUser -Force -AllowClobber"
+        }
     }
+    Import-Module Az.Accounts -MinimumVersion 3.0.0 -ErrorAction Stop
     # Verify Az.ResourceGraph module (optional, improves inventory performance)
     if (-not (Get-Module -ListAvailable -Name Az.ResourceGraph)) {
         Write-Status "Installing Az.ResourceGraph for optimized inventory..." "INFO"
@@ -1040,7 +1320,10 @@ function Initialize-Assessment {
         Write-Host "  A browser window will open for authentication." -ForegroundColor Yellow
         Write-Host ""
         try {
-            Connect-AzAccount -ErrorAction Stop | Out-Null
+            $connectParameters = @{ ErrorAction = 'Stop' }
+            if ($TenantId) { $connectParameters.Tenant = $TenantId }
+            if ($UseDeviceAuthentication) { $connectParameters.UseDeviceAuthentication = $true }
+            Connect-AzAccount @connectParameters | Out-Null
             Write-Status "Authentication successful." "OK"
         } catch {
             Write-Status "Authentication error: $($_.Exception.Message)" "ERROR"
@@ -1057,11 +1340,14 @@ function Initialize-Assessment {
     # ── Auto-connect Microsoft Graph for CA/PIM checks ──
     Write-Status "Checking Microsoft Graph connectivity..." "INFO"
     $graphModuleAvailable = Get-Module -ListAvailable -Name Microsoft.Graph.Authentication -ErrorAction SilentlyContinue
-    if ($graphModuleAvailable) {
+    if ($WorkerMode) {
+        Write-Status "Microsoft Graph authentication is coordinator-owned; skipped in subscription worker." "INFO"
+    } elseif ($graphModuleAvailable) {
         Import-Module Microsoft.Graph.Authentication -ErrorAction SilentlyContinue
         $mgCtx = $null
         try { $mgCtx = Get-MgContext -ErrorAction SilentlyContinue } catch { }
         $requiredScopes = @('Policy.Read.All', 'RoleManagement.Read.Directory')
+        if ($IncludeM365Copilot) { $requiredScopes += 'Reports.Read.All' }
         $hasAllScopes = $false
         if ($mgCtx) {
             $hasAllScopes = ($requiredScopes | Where-Object { $mgCtx.Scopes -contains $_ }).Count -eq $requiredScopes.Count
@@ -1092,11 +1378,11 @@ function Initialize-Assessment {
             # Strategy 2: Interactive login (only if token reuse failed and not Cloud Shell)
             if (-not $graphConnected) {
                 $isCloudShell = $env:AZUREPS_HOST_ENVIRONMENT -like 'cloud-shell*' -or $env:ACC_TERM_ID
-                if ($isCloudShell) {
-                    Write-Status "Cloud Shell detected — Graph token reuse failed. CA/PIM will be manual checklist" "WARN"
+                if ($isCloudShell -or $WorkerMode -or $SkipGraphLogin) {
+                    Write-Status "Interactive Graph login skipped. CA/PIM will be manual checklist" "WARN"
                 } else {
                     try {
-                        Connect-MgGraph -Scopes ($requiredScopes -join ',') -NoWelcome -ErrorAction Stop
+                        Connect-MgGraph -Scopes $requiredScopes -NoWelcome -ErrorAction Stop
                         $mgCtx = Get-MgContext -ErrorAction SilentlyContinue
                         if ($mgCtx) {
                             Write-Status "Microsoft Graph connected — CA/PIM checks will run automatically" "OK"
@@ -1122,12 +1408,28 @@ function Initialize-Assessment {
         Write-Status "No active Azure session found. Run Connect-AzAccount first." "ERROR"
         throw "No active Azure session. Please authenticate with Connect-AzAccount before using -SkipLogin."
     }
-    $detectedTenantId = $currentContext.Tenant.Id
+    if ($TenantId -and $currentContext.Tenant.Id -ne $TenantId) {
+        throw "The active Azure context belongs to tenant '$($currentContext.Tenant.Id)', but -TenantId '$TenantId' was requested. Authenticate to that tenant or omit -SkipLogin."
+    }
+    $detectedTenantId = if ($TenantId) { $TenantId } else { $currentContext.Tenant.Id }
     Write-Status "Active tenant: $detectedTenantId" "INFO"
-    if ($SubscriptionId) {
-        $subs = Get-AzSubscription -SubscriptionId $SubscriptionId -TenantId $detectedTenantId -ErrorAction SilentlyContinue
+    $requestedSubscriptionIds = @($SubscriptionId | Where-Object { $_ } | Select-Object -Unique)
+    if ($WorkerMode -and $requestedSubscriptionIds.Count -eq 1) {
+        $availableSubscriptions = @(Get-AzSubscription -SubscriptionId $requestedSubscriptionIds[0] -TenantId $detectedTenantId -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Enabled' })
     } else {
-        $subs = Get-AzSubscription -TenantId $detectedTenantId -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Enabled' }
+        $availableSubscriptions = @(Get-AzSubscription -TenantId $detectedTenantId -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Enabled' })
+    }
+    if ($requestedSubscriptionIds.Count -gt 0) {
+        $subs = @($requestedSubscriptionIds | ForEach-Object {
+            $requestedId = $_
+            $availableSubscriptions | Where-Object { $_.Id -eq $requestedId } | Select-Object -First 1
+        } | Where-Object { $_ })
+        $missingSubscriptionIds = @($requestedSubscriptionIds | Where-Object { $_ -notin @($subs.Id) })
+        if ($missingSubscriptionIds.Count -gt 0) {
+            Write-Status "Skipping inaccessible or unknown subscription IDs: $($missingSubscriptionIds -join ', ')" "WARN"
+        }
+    } else {
+        $subs = $availableSubscriptions
     }
 
     if (-not $subs -or $subs.Count -eq 0) {
@@ -1148,7 +1450,11 @@ function Initialize-Assessment {
 
     # ── Pre-flight permission validation ──
     $allSubIds = $script:Subscriptions | ForEach-Object { $_.Id }
-    Test-PreFlightPermissions -TenantId $detectedTenantId -SubscriptionIds $allSubIds
+    if (-not $WorkerMode) {
+        Test-PreFlightPermissions -TenantId $detectedTenantId -SubscriptionIds $allSubIds
+    } else {
+        Write-Status "Permission preflight already completed by the coordinator; skipped in worker." "INFO"
+    }
 
     # Create output directory
     if (-not (Test-Path $OutputPath)) {
@@ -1181,6 +1487,8 @@ function Invoke-DataCollection {
     $phaseTimer.Restart()
     $subCtx = if ($SubId) { $SubId } else { (Get-AzContext).Subscription.Id }
     $graphAvailable = Get-Module -ListAvailable -Name Az.ResourceGraph
+    $script:CachedResourceTypeCounts = $null
+    $script:CachedResourcesByType = $null
     if ($graphAvailable) {
         Import-Module Az.ResourceGraph -ErrorAction SilentlyContinue
         Write-Status "  Using Resource Graph (fast path)..." "INFO"
@@ -1188,65 +1496,87 @@ function Invoke-DataCollection {
         $rgQuery = @"
 resources
 | where subscriptionId == '$subCtx'
-| project id, name, type, location, resourceGroup, tags, sku, properties, zones, identity
-| order by type asc
+| project id, name, type, kind, location, resourceGroup, tags, sku, plan, properties, zones, identity
 "@
         $allResources = [System.Collections.Generic.List[PSObject]]::new()
         $skipToken = $null
-        do {
-            $params = @{ Query = $rgQuery; Subscription = $subCtx; First = 1000; ErrorAction = 'SilentlyContinue' }
-            if ($skipToken) { $params['SkipToken'] = $skipToken }
-            $page = Search-AzGraph @params
-            if ($page) {
-                foreach ($item in $page) { $allResources.Add($item) }
-                $skipToken = $page.SkipToken
-            } else { $skipToken = $null }
-        } while ($skipToken)
+        try {
+            do {
+                $params = @{ Query = $rgQuery; Subscription = $subCtx; First = 1000; ErrorAction = 'Stop' }
+                if ($skipToken) { $params['SkipToken'] = $skipToken }
+                $page = Search-AzGraph @params
+                if ($page) {
+                    foreach ($item in $page) { $allResources.Add($item) }
+                    $skipToken = $page.SkipToken
+                } else { $skipToken = $null }
+            } while ($skipToken)
 
-        if ($allResources -and $allResources.Count -gt 0) {
-            Write-Status "  Resource Graph returned $($allResources.Count) resources" "OK"
-            $byType = $allResources | Group-Object -Property type -AsHashTable -AsString
-        } else {
-            $byType = @{}
+            $script:CachedResourceTypeCounts = @{}
+            $script:CachedResourcesByType = @{}
+            foreach ($resource in $allResources) {
+                $resourceType = ([string]$resource.type).ToLowerInvariant()
+                if (-not $resourceType) { continue }
+                if (-not $script:CachedResourceTypeCounts.ContainsKey($resourceType)) {
+                    $script:CachedResourceTypeCounts[$resourceType] = 0
+                    $script:CachedResourcesByType[$resourceType] = [System.Collections.Generic.List[object]]::new()
+                }
+                $script:CachedResourceTypeCounts[$resourceType]++
+                $script:CachedResourcesByType[$resourceType].Add($resource)
+            }
+            $script:CachedResourceGraphResources = @($allResources)
+            Write-Status "  Resource Graph returned $($allResources.Count) resources across $($script:CachedResourceTypeCounts.Count) types" "OK"
+        } catch {
+            $script:CachedResourceTypeCounts = $null
+            $script:CachedResourceGraphResources = $null
+            $script:CachedResourcesByType = $null
+            Write-Status "  Resource Graph inventory unavailable; detailed queries will use safe fallback: $($_.Exception.Message)" "WARN"
         }
         Send-KeepAlive
-    } else {
-        $byType = @{}
     }
     Write-Status "  ⏱ Phase 1 (Resource Graph): $([math]::Round($phaseTimer.Elapsed.TotalSeconds, 1))s" "INFO"
 
     # ── Phase 2: Cmdlet-based fetch ──
     $phaseTimer.Restart()
+    $script:CachedResourceGroups = @(Invoke-AzCommandSafely { Get-AzResourceGroup -ErrorAction SilentlyContinue } "Error retrieving resource groups")
     $dcTimer.Restart()
-    $script:CachedVMs = Invoke-AzCommandSafely { Get-AzVM -Status -ErrorAction SilentlyContinue } "Error retrieving VMs"
+    $script:CachedVMs = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.compute/virtualmachines' { Get-AzVM -Status -ErrorAction SilentlyContinue } "Error retrieving VMs"
     Write-Status "    Get-AzVM -Status: $([math]::Round($dcTimer.Elapsed.TotalSeconds, 1))s ($(@($script:CachedVMs).Count) VMs)" "INFO"
     Send-KeepAlive
 
     $dcTimer.Restart()
-    $script:CachedVNets = Invoke-AzCommandSafely { Get-AzVirtualNetwork -ErrorAction SilentlyContinue } "Error retrieving VNets"
-    $script:CachedNSGs  = Invoke-AzCommandSafely { Get-AzNetworkSecurityGroup -ErrorAction SilentlyContinue } "Error retrieving NSGs"
+    $script:CachedVNets = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.network/virtualnetworks' { Get-AzVirtualNetwork -ErrorAction SilentlyContinue } "Error retrieving VNets"
+    $script:CachedNSGs  = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.network/networksecuritygroups' { Get-AzNetworkSecurityGroup -ErrorAction SilentlyContinue } "Error retrieving NSGs"
     Write-Status "    VNets+NSGs: $([math]::Round($dcTimer.Elapsed.TotalSeconds, 1))s" "INFO"
     Send-KeepAlive
 
     $dcTimer.Restart()
-    $script:CachedSqlServers = Invoke-AzCommandSafely { Get-AzSqlServer -ErrorAction SilentlyContinue } "Error retrieving SQL Servers"
-    $script:CachedKeyVaults = Invoke-AzCommandSafely { Get-AzKeyVault -ErrorAction SilentlyContinue } "Error retrieving Key Vaults"
+    $script:CachedSqlServers = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.sql/servers' { Get-AzSqlServer -ErrorAction SilentlyContinue } "Error retrieving SQL Servers"
+    $script:CachedKeyVaults = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.keyvault/vaults' { Get-AzKeyVault -ErrorAction SilentlyContinue } "Error retrieving Key Vaults"
     Write-Status "    SQL+KeyVaults: $([math]::Round($dcTimer.Elapsed.TotalSeconds, 1))s" "INFO"
     Send-KeepAlive
 
     $dcTimer.Restart()
-    $script:CachedStorageAccounts = Invoke-AzCommandSafely { Get-AzStorageAccount -ErrorAction SilentlyContinue } "Error retrieving Storage Accounts"
+    $script:CachedStorageAccounts = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.storage/storageaccounts' { Get-AzStorageAccount -ErrorAction SilentlyContinue } "Error retrieving Storage Accounts"
     Write-Status "    StorageAccounts: $([math]::Round($dcTimer.Elapsed.TotalSeconds, 1))s ($(@($script:CachedStorageAccounts).Count))" "INFO"
 
     $dcTimer.Restart()
     Write-Status "  Fetching App Service details (cached for all analyses)..." "INFO"
-    $basicApps = Invoke-AzCommandSafely { Get-AzWebApp -ErrorAction SilentlyContinue } "Error retrieving Web Apps"
+    $basicApps = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.web/sites' { Get-AzWebApp -ErrorAction SilentlyContinue } "Error retrieving Web Apps"
     $script:CachedWebApps = $basicApps
     $script:CachedWebAppDetails = @{}
     if ($basicApps) {
         foreach ($app in $basicApps) {
-            $detail = Safe-AzCommand { Get-AzWebApp -Name $app.Name -ResourceGroupName $app.ResourceGroup -ErrorAction SilentlyContinue } "AppDetail $($app.Name)"
-            if ($detail) { $script:CachedWebAppDetails[$app.Id] = $detail }
+            $resourceGroupName = if ($app.ResourceGroupName) { $app.ResourceGroupName } else { $app.ResourceGroup }
+            if (-not $app.ResourceGroup -and $resourceGroupName) {
+                $app | Add-Member -MemberType NoteProperty -Name ResourceGroup -Value $resourceGroupName -Force
+            }
+            $detail = Safe-AzCommand { Get-AzWebApp -Name $app.Name -ResourceGroupName $resourceGroupName -ErrorAction SilentlyContinue } "AppDetail $($app.Name)"
+            if ($detail) {
+                if (-not $detail.ResourceGroup -and $resourceGroupName) {
+                    $detail | Add-Member -MemberType NoteProperty -Name ResourceGroup -Value $resourceGroupName -Force
+                }
+                $script:CachedWebAppDetails[$app.Id] = $detail
+            }
             Send-KeepAlive
         }
         Write-Status "    WebApp details: $([math]::Round($dcTimer.Elapsed.TotalSeconds, 1))s ($($script:CachedWebAppDetails.Count) apps)" "INFO"
@@ -1254,16 +1584,16 @@ resources
     Send-KeepAlive
 
     $dcTimer.Restart()
-    $script:CachedDisks            = Invoke-AzCommandSafely { Get-AzDisk -ErrorAction SilentlyContinue } "Error retrieving Disks"
-    $script:CachedNICs             = Invoke-AzCommandSafely { Get-AzNetworkInterface -ErrorAction SilentlyContinue } "Error retrieving NICs"
-    $script:CachedPublicIPs        = Invoke-AzCommandSafely { Get-AzPublicIpAddress -ErrorAction SilentlyContinue } "Error retrieving Public IPs"
+    $script:CachedDisks            = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.compute/disks' { Get-AzDisk -ErrorAction SilentlyContinue } "Error retrieving Disks"
+    $script:CachedNICs             = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.network/networkinterfaces' { Get-AzNetworkInterface -ErrorAction SilentlyContinue } "Error retrieving NICs"
+    $script:CachedPublicIPs        = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.network/publicipaddresses' { Get-AzPublicIpAddress -ErrorAction SilentlyContinue } "Error retrieving Public IPs"
     Send-KeepAlive
-    $script:CachedPrivateEndpoints = Invoke-AzCommandSafely { Get-AzPrivateEndpoint -ErrorAction SilentlyContinue } "Error retrieving Private Endpoints"
-    $script:CachedLoadBalancers    = Invoke-AzCommandSafely { Get-AzLoadBalancer -ErrorAction SilentlyContinue } "Error retrieving Load Balancers"
-    $script:CachedAppGateways      = Invoke-AzCommandSafely { Get-AzApplicationGateway -ErrorAction SilentlyContinue } "Error retrieving App Gateways"
+    $script:CachedPrivateEndpoints = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.network/privateendpoints' { Get-AzPrivateEndpoint -ErrorAction SilentlyContinue } "Error retrieving Private Endpoints"
+    $script:CachedLoadBalancers    = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.network/loadbalancers' { Get-AzLoadBalancer -ErrorAction SilentlyContinue } "Error retrieving Load Balancers"
+    $script:CachedAppGateways      = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.network/applicationgateways' { Get-AzApplicationGateway -ErrorAction SilentlyContinue } "Error retrieving App Gateways"
     Send-KeepAlive
-    $script:CachedFirewalls        = Invoke-AzCommandSafely { Get-AzFirewall -ErrorAction SilentlyContinue } "Error retrieving Firewalls"
-    $script:CachedBastions         = Invoke-AzCommandSafely { Get-AzBastion -ErrorAction SilentlyContinue } "Error retrieving Bastions"
+    $script:CachedFirewalls        = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.network/azurefirewalls' { Get-AzFirewall -ErrorAction SilentlyContinue } "Error retrieving Firewalls"
+    $script:CachedBastions         = Invoke-AzCollectionWhenResourceTypeExists 'microsoft.network/bastionhosts' { Get-AzBastion -ErrorAction SilentlyContinue } "Error retrieving Bastions"
     Write-Status "    Network+Disks+Other: $([math]::Round($dcTimer.Elapsed.TotalSeconds, 1))s" "INFO"
     Write-Status "  ⏱ Phase 2 (Cmdlets): $([math]::Round($phaseTimer.Elapsed.TotalSeconds, 1))s" "INFO"
 
@@ -1285,27 +1615,19 @@ resources
     # ── Phase 4: Pre-cache VM extensions via Resource Graph ──
     $phaseTimer.Restart()
     $script:CachedVMExtensions = @{}
-    if ($graphAvailable -and $script:CachedVMs) {
-        Write-Status "  Querying VM extensions via Resource Graph..." "INFO"
-        $extResults = Invoke-AzCommandSafely {
-            Search-AzGraph -Query @"
-resources
-| where type =~ 'microsoft.compute/virtualmachines/extensions'
-| extend vmId = tolower(tostring(split(id, '/extensions/')[0]))
-| project vmId, extensionType = tostring(properties.type)
-"@ -Subscription $subCtx -First 1000 -ErrorAction SilentlyContinue
-        } "Resource Graph VM extensions query"
-
-        if ($extResults) {
-            foreach ($ext in $extResults) {
-                $vmKey = $ext.vmId
+    if ($null -ne $script:CachedResourceGraphResources -and $script:CachedVMs) {
+        Write-Status "  Indexing VM extensions from Resource Graph cache..." "INFO"
+        $extensionResources = @(Get-CachedResourceGraphResourcesByType 'microsoft.compute/virtualmachines/extensions')
+        if ($extensionResources.Count -gt 0) {
+            foreach ($extension in $extensionResources) {
+                $vmKey = ([string]$extension.id -replace '/extensions/[^/]+$', '').ToLowerInvariant()
                 if (-not $script:CachedVMExtensions.ContainsKey($vmKey)) {
                     $script:CachedVMExtensions[$vmKey] = [System.Collections.Generic.List[string]]::new()
                 }
-                $script:CachedVMExtensions[$vmKey].Add($ext.extensionType)
+                $script:CachedVMExtensions[$vmKey].Add([string]$extension.properties.type)
             }
-            Write-Status "  ⏱ Phase 4 (Extensions): $([math]::Round($phaseTimer.Elapsed.TotalSeconds, 1))s ($($script:CachedVMExtensions.Count) VMs)" "INFO"
         }
+        Write-Status "  ⏱ Phase 4 (Extensions): $([math]::Round($phaseTimer.Elapsed.TotalSeconds, 1))s ($($script:CachedVMExtensions.Count) VMs)" "INFO"
     }
 
     Write-Status "Data collected successfully." "OK"
@@ -1319,8 +1641,9 @@ function Get-SubscriptionCostAnalysis {
 
     Write-Status "Collecting cost data (last 6 months)..." "INFO"
 
-    $endDate = (Get-Date).ToString("yyyy-MM-dd")
-    $startDate = (Get-Date).AddMonths(-6).ToString("yyyy-MM-dd")
+    $costWindowEnd = (Get-Date).ToUniversalTime().Date
+    $endDate = $costWindowEnd.ToString("yyyy-MM-dd")
+    $startDate = $costWindowEnd.AddMonths(-6).ToString("yyyy-MM-dd")
 
     # Query monthly cost grouped by service name
     $body = @{
@@ -1460,9 +1783,19 @@ function Get-ResourceInventory {
 
     Write-Status "Collecting resource inventory..." "SECTION"
 
-    # Use Resource Graph if available (faster and supports pagination)
+    # Reuse the centralized Resource Graph result; query only when that collection was unavailable.
     $resources = $null
-    if (Get-Module -ListAvailable -Name Az.ResourceGraph) {
+    if ($null -ne $script:CachedResourceGraphResources) {
+        $resources = @($script:CachedResourceGraphResources | ForEach-Object {
+            [PSCustomObject]@{
+                Name              = $_.name
+                ResourceType      = $_.type
+                Location          = $_.location
+                ResourceGroupName = $_.resourceGroup
+                Tags              = $_.tags
+            }
+        })
+    } elseif (Get-Module -ListAvailable -Name Az.ResourceGraph) {
         Import-Module Az.ResourceGraph -ErrorAction SilentlyContinue
         $graphResults = @()
         $skipToken = $null
@@ -1484,7 +1817,7 @@ function Get-ResourceInventory {
             }
         }
     }
-    if (-not $resources) {
+    if ($null -eq $resources) {
         $resources = Invoke-AzCommandSafely { Get-AzResource -ErrorAction SilentlyContinue } "Error retrieving resources"
     }
     if (-not $resources) { return }
@@ -1536,6 +1869,12 @@ function Analyze-Networking {
 
     # --- VNETs ---
     $vnets = $script:CachedVNets
+    $publicEndpointResourceGroups = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($publicIp in @($script:CachedPublicIPs)) {
+        if ($publicIp.IpConfiguration -and $publicIp.ResourceGroupName) {
+            [void]$publicEndpointResourceGroups.Add([string]$publicIp.ResourceGroupName)
+        }
+    }
     if ($vnets) {
         Write-Status "  VNets found: $($vnets.Count)" "INFO"
         foreach ($vnet in $vnets) {
@@ -1631,10 +1970,7 @@ function Analyze-Networking {
 
             # Verify DDoS Protection — only flag if VNet has public-facing resources
             if (-not $vnet.DdosProtectionPlan) {
-                # Check if any associated (non-orphaned) PIP exists in the same resource group as the VNet
-                $vnetHasPublicEndpoint = $script:CachedPublicIPs | Where-Object {
-                    $_.ResourceGroupName -eq $vnet.ResourceGroupName -and $_.IpConfiguration
-                }
+                $vnetHasPublicEndpoint = $publicEndpointResourceGroups.Contains([string]$vnet.ResourceGroupName)
                 if ($vnetHasPublicEndpoint) {
                     $findingParams = @{
                         Pillar         = "Security"
@@ -1657,6 +1993,15 @@ function Analyze-Networking {
     # --- NSGs ---
     Write-Status "  Analyzing Network Security Groups..." "INFO"
     $nsgs = $script:CachedNSGs
+    $flowLogInventoryAvailable = $null -ne $script:CachedResourceGraphResources
+    $flowLogTargetIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($flowLogInventoryAvailable) {
+        foreach ($flowLog in @(Get-CachedResourceGraphResourcesByType 'microsoft.network/networkwatchers/flowlogs')) {
+            if ($flowLog.properties.enabled -ne $false -and $flowLog.properties.targetResourceId) {
+                [void]$flowLogTargetIds.Add([string]$flowLog.properties.targetResourceId)
+            }
+        }
+    }
     if ($nsgs) {
         foreach ($nsg in $nsgs) {
             $rules = $nsg.SecurityRules + $nsg.DefaultSecurityRules
@@ -1725,21 +2070,8 @@ function Analyze-Networking {
                 Add-Finding @findingParams
             }
 
-            # NSG Flow Logs — check via flowLogConfigurations on NSG properties
-            $hasFlowLog = $false
-            if ($nsg.FlowLog) { $hasFlowLog = $true }
-            elseif ($nsg.Id) {
-                # Check via Network Watcher status (Resource Graph pre-cached or property check)
-                $flowConfigs = $nsg.NetworkSecurityGroup.FlowLogConfigurations
-                if (-not $flowConfigs) {
-                    # Check provisioned flow log status via REST if available
-                    try {
-                        $nsgDetail = Get-AzNetworkSecurityGroup -Name $nsg.Name -ResourceGroupName $nsg.ResourceGroupName -ErrorAction SilentlyContinue
-                        if ($nsgDetail -and $nsgDetail.FlowLog) { $hasFlowLog = $true }
-                    } catch {}
-                } else { $hasFlowLog = $true }
-            }
-            if (-not $hasFlowLog) {
+            # Network Watcher flow logs are child resources, not NSG properties.
+            if ($flowLogInventoryAvailable -and -not $flowLogTargetIds.Contains([string]$nsg.Id)) {
                 $findingParams = @{
                     Pillar         = "Security"
                     Severity       = "Medium"
@@ -1748,7 +2080,7 @@ function Analyze-Networking {
                     ResourceType   = "NSG"
                     ResourceGroup  = $nsg.ResourceGroupName
                     Subscription   = $SubName
-                    Description    = "NSG does not appear to have Flow Logs enabled."
+                    Description    = "No enabled Network Watcher Flow Log targets this NSG."
                     Recommendation = "Enable NSG Flow Logs v2 with Traffic Analytics for traffic visibility."
                     Impact         = "Without network traffic visibility, threat detection and troubleshooting are hindered."
                 }
@@ -1812,30 +2144,32 @@ function Analyze-Networking {
 
     # --- NAT Gateways ---
     Write-Status "  Analyzing NAT Gateways..." "INFO"
-    $natGwResources = Get-AzResource -ResourceType 'Microsoft.Network/natGateways' -ErrorAction SilentlyContinue
-    if ($natGwResources) {
-        foreach ($natRes in $natGwResources) {
-            try {
-                $natGw = Get-AzNatGateway -Name $natRes.Name -ResourceGroupName $natRes.ResourceGroupName -ErrorAction SilentlyContinue
-                $natPips = if ($natGw.PublicIpAddresses) {
-                    ($natGw.PublicIpAddresses | ForEach-Object { $_.Id.Split('/')[-1] }) -join ", "
-                } else { "" }
-                $natSubnets = if ($natGw.Subnets) {
-                    ($natGw.Subnets | ForEach-Object { $_.Id.Split('/')[-1] }) -join ", "
-                } else { "" }
-                $script:NetworkTopology.Add([PSCustomObject]@{
-                    Type          = "NatGateway"
-                    Name          = $natRes.Name
-                    ResourceGroup = $natRes.ResourceGroupName
-                    Location      = $natRes.Location
-                    PublicIPs     = $natPips
-                    Subnets       = $natSubnets
-                    Sku           = if ($natGw.Sku) { $natGw.Sku.Name } else { "Standard" }
-                    Subscription  = $SubName
-                })
-            } catch { continue }
-        }
+    $natGateways = if ($null -ne $script:CachedResourceGraphResources) {
+        @(Get-CachedResourceGraphResourcesByType 'microsoft.network/natgateways')
+    } else {
+        @(Invoke-AzCommandSafely { Get-AzNatGateway -ErrorAction SilentlyContinue } "Error retrieving NAT Gateways")
     }
+    foreach ($natGw in $natGateways) {
+        $natProperties = if ($natGw.PSObject.Properties['properties']) { $natGw.properties } else { $natGw }
+        $natPublicIPs = if ($natProperties.publicIpAddresses) {
+            ($natProperties.publicIpAddresses | ForEach-Object { $_.id.Split('/')[-1] }) -join ", "
+        } else { "" }
+        $natSubnets = if ($natProperties.subnets) {
+            ($natProperties.subnets | ForEach-Object { $_.id.Split('/')[-1] }) -join ", "
+        } else { "" }
+        $resourceGroupName = if ($natGw.ResourceGroupName) { $natGw.ResourceGroupName } else { $natGw.resourceGroup }
+        $skuName = if ($natGw.sku -and $natGw.sku.name) { $natGw.sku.name } elseif ($natGw.Sku) { $natGw.Sku.Name } else { "Standard" }
+        $script:NetworkTopology.Add([PSCustomObject]@{
+            Type          = "NatGateway"
+            Name          = $natGw.Name
+            ResourceGroup = $resourceGroupName
+            Location      = $natGw.Location
+            PublicIPs     = $natPublicIPs
+            Subnets       = $natSubnets
+            Sku           = $skuName
+            Subscription  = $SubName
+        })
+        }
 
     # --- Load Balancers ---
     Write-Status "  Analyzing Load Balancers..." "INFO"
@@ -2247,6 +2581,7 @@ function Analyze-Databases {
 
             # TDE
             $databases = Safe-AzCommand { Get-AzSqlDatabase -ServerName $srvName -ResourceGroupName $rg -ErrorAction SilentlyContinue | Where-Object { $_.DatabaseName -ne "master" } }
+            $failoverGroups = Safe-AzCommand { Get-AzSqlDatabaseFailoverGroup -ServerName $srvName -ResourceGroupName $rg -ErrorAction SilentlyContinue }
             foreach ($db in $databases) {
                 $tde = Safe-AzCommand { Get-AzSqlDatabaseTransparentDataEncryption -ServerName $srvName -ResourceGroupName $rg -DatabaseName $db.DatabaseName -ErrorAction SilentlyContinue }
                 if ($tde -and $tde.State -ne "Enabled") {
@@ -2268,11 +2603,7 @@ function Analyze-Databases {
                 # Geo-replication
                 $dbEdition = if ($db.Edition) { $db.Edition } elseif ($db.SkuName) { $db.SkuName } else { 'Unknown' }
                 if ($dbEdition -notin @('Basic', 'Free', 'System', 'Unknown')) {
-                    $geoRep = $null
-                    try {
-                        $links = Get-AzSqlDatabaseFailoverGroup -ServerName $srvName -ResourceGroupName $rg -ErrorAction SilentlyContinue
-                        if ($links) { $geoRep = $links | Where-Object { $_.Databases -contains $db.Id } }
-                    } catch {}
+                    $geoRep = if ($failoverGroups) { $failoverGroups | Where-Object { $_.Databases -contains $db.Id } } else { $null }
                     if (-not $geoRep) {
                         try { $geoRep = Invoke-AzRestMethod -Path "/subscriptions/$SubId/resourceGroups/$rg/providers/Microsoft.Sql/servers/$srvName/databases/$($db.DatabaseName)/replicationLinks?api-version=2022-05-01-preview" -Method GET -ErrorAction SilentlyContinue | ForEach-Object { if ($_.StatusCode -eq 200 -and $_.Content) { ($_.Content | ConvertFrom-Json).value } } } catch {}
                     }
@@ -2486,8 +2817,7 @@ function Analyze-KeyVaults {
     if (-not $kvs) { return }
 
     foreach ($kv in $kvs) {
-        $kvDetail = Safe-AzCommand { Get-AzKeyVault -VaultName $kv.VaultName -ErrorAction SilentlyContinue } "Error KV detail $($kv.VaultName)"
-        if (-not $kvDetail) { continue }
+        $kvDetail = $kv
 
         # Soft Delete is now mandatory (since Feb 2025) — no need to check
         # Purge Protection (optional, recommended)
@@ -3398,11 +3728,13 @@ function Analyze-ZeroTrust {
 
     # 17. Role assignments: check for broad Owner/Contributor (including MG-scope inherited)
     $roleAssignments = $null
-    if ($script:CachedRoleAssignments.ContainsKey($SubId)) {
-        $roleAssignments = $script:CachedRoleAssignments[$SubId] | Where-Object {
-            $_.properties.roleDefinitionId -match '8e3af657-a8ff-443c-a75c-2fe8c4bcb635|b24988ac-6180-42a0-ab88-20f7382dd24c' -and
-            $_.properties.principalType -eq 'User'
-        }
+    if ($script:CachedRoleAssignmentsAvailable) {
+        $roleAssignments = if ($script:CachedRoleAssignments.ContainsKey($SubId)) {
+            $script:CachedRoleAssignments[$SubId] | Where-Object {
+                $_.roleId -match '8e3af657-a8ff-443c-a75c-2fe8c4bcb635|b24988ac-6180-42a0-ab88-20f7382dd24c' -and
+                $_.principalType -eq 'User'
+            }
+        } else { @() }
     } else {
         $roleAssignments = Invoke-AzCommandSafely {
             Get-AzRoleAssignment -Scope "/subscriptions/$SubId" -ErrorAction SilentlyContinue |
@@ -4253,10 +4585,8 @@ function Analyze-CostAdvisor {
             else { Write-Status "  Azure Advisor: No cost recommendations" "OK" }
         } else {
             # Fallback to REST API
-            $advisorResp = Invoke-AzRestMethod -Path "/subscriptions/$SubId/providers/Microsoft.Advisor/recommendations?api-version=2022-10-01&`$filter=Category eq 'Cost'" -Method GET -ErrorAction Stop
-            if ($advisorResp.StatusCode -ne 200) { throw "Advisor API returned $($advisorResp.StatusCode)" }
-            $advisorData = ($advisorResp.Content | ConvertFrom-Json)
-            $costRecs = $advisorData.value | Where-Object { $_.properties.category -eq 'Cost' }
+            $advisorPath = "/subscriptions/$SubId/providers/Microsoft.Advisor/recommendations?api-version=2022-10-01&`$filter=Category eq 'Cost'"
+            $costRecs = @(Get-AzRestPagedValues -Path $advisorPath | Where-Object { $_.properties.category -eq 'Cost' })
             foreach ($rec in $costRecs) {
                 Add-CommitmentRecommendationFromAdvisor $rec $SubId $SubName
                 $resId   = $rec.properties.resourceMetadata.resourceId
@@ -4318,16 +4648,20 @@ function Analyze-CostAdvisor {
 
     # Dev/Test VMs without auto-shutdown — use pre-cached schedules
     $shutdownSchedules = @{}
-    if ($script:CachedAutoShutdown.ContainsKey($SubId)) {
+    if ($script:CachedAutoShutdownAvailable -and $script:CachedAutoShutdown.ContainsKey($SubId)) {
         foreach ($sched in $script:CachedAutoShutdown[$SubId]) {
             $vmName = $sched.name -replace '^shutdown-computevm-', ''
             $shutdownSchedules[$vmName.ToLower()] = $true
         }
     }
+    $resourceGroupTags = @{}
+    foreach ($resourceGroup in @($script:CachedResourceGroups)) {
+        $resourceGroupTags[[string]$resourceGroup.ResourceGroupName] = $resourceGroup.Tags
+    }
     foreach ($vm in $vms) {
         try {
             $hasShutdown = $false
-            if ($shutdownSchedules.Count -gt 0) {
+            if ($script:CachedAutoShutdownAvailable) {
                 $hasShutdown = $shutdownSchedules.ContainsKey($vm.Name.ToLower())
             } else {
                 # Fallback to REST if no cache
@@ -4336,7 +4670,7 @@ function Analyze-CostAdvisor {
                 $hasShutdown = ($shutdownResp.StatusCode -eq 200)
             }
             if (-not $hasShutdown) {
-                $rgTags   = try { (Get-AzResourceGroup -Name $vm.ResourceGroupName -ErrorAction SilentlyContinue).Tags } catch { @{} }
+                $rgTags = if ($resourceGroupTags.ContainsKey([string]$vm.ResourceGroupName)) { $resourceGroupTags[[string]$vm.ResourceGroupName] } else { @{} }
                 $isDevTest = ($vm.Tags.Environment -match 'dev|test|sandbox|lab|poc') -or ($rgTags.Environment -match 'dev|test|sandbox|lab|poc')
                 if ($isDevTest) {
                     Add-Finding -ResourceName $vm.Name `
@@ -4390,14 +4724,23 @@ function Analyze-CostAdvisor {
 # 14b. AZURE RESERVATIONS & SAVINGS PLANS
 # ============================================================================
 function Analyze-Reservations {
-    param([string]$SubId, [string]$SubName)
+    param(
+        [string]$SubId,
+        [string]$SubName,
+        [switch]$SkipTenantInventory,
+        [switch]$TenantInventoryOnly
+    )
 
     Write-Status "Analyzing Azure Reservations & Savings Plans..." "SECTION"
 
-    Get-NativeCommitmentRecommendations -SubId $SubId -SubName $SubName
-    $preferredCommitment = $script:CommitmentRecommendations | Where-Object {
-        $_.SubscriptionId -eq $SubId -and $_.DecisionStatus -eq 'Preferred'
-    } | Select-Object -First 1
+    if (-not $TenantInventoryOnly) {
+        Get-NativeCommitmentRecommendations -SubId $SubId -SubName $SubName
+    }
+    $preferredCommitment = if (-not $TenantInventoryOnly) {
+        $script:CommitmentRecommendations | Where-Object {
+            $_.SubscriptionId -eq $SubId -and $_.DecisionStatus -eq 'Preferred'
+        } | Select-Object -First 1
+    } else { $null }
     if ($preferredCommitment) {
         $commitmentDescription = if ($preferredCommitment.Type -eq 'SavingsPlan') {
             "$($preferredCommitment.HourlyCommitment) $($preferredCommitment.SavingsCurrency) per hour"
@@ -4414,39 +4757,62 @@ function Analyze-Reservations {
     }
 
     # ── 1. Reservation Orders (tenant-wide, fetched once) ──
-    if ($script:ReservationData.Count -eq 0) {
+    if (-not $SkipTenantInventory -and -not $script:ReservationInventoryLoaded) {
         try {
-            $riResp = Invoke-AzRestMethod -Path "/providers/Microsoft.Capacity/reservationOrders?api-version=2022-11-01" -Method GET -ErrorAction Stop
-            if ($riResp.StatusCode -eq 200) {
-                $riOrders = ($riResp.Content | ConvertFrom-Json).value
-                foreach ($order in $riOrders) {
+            $riOrders = @(Get-AzRestPagedValues -Path "/providers/Microsoft.Capacity/reservationOrders?api-version=2022-11-01")
+            foreach ($order in $riOrders) {
                     $orderId = $order.id
-                    $orderName = $order.name
                     # Get reservations within each order
                     try {
-                        $riDetailResp = Invoke-AzRestMethod -Path "${orderId}/reservations?api-version=2022-11-01" -Method GET -ErrorAction Stop
-                        if ($riDetailResp.StatusCode -eq 200) {
-                            $reservations = ($riDetailResp.Content | ConvertFrom-Json).value
-                            foreach ($ri in $reservations) {
+                        $reservations = @(Get-AzRestPagedValues -Path "${orderId}/reservations?api-version=2022-11-01")
+                        foreach ($ri in $reservations) {
                                 $props = $ri.properties
                                 $expiryDate = if ($props.expiryDate) { [datetime]$props.expiryDate } else { $null }
                                 $purchaseDate = if ($props.purchaseDate) { [datetime]$props.purchaseDate } else { $null }
                                 $daysToExpiry = if ($expiryDate) { [math]::Round(($expiryDate - (Get-Date)).TotalDays) } else { -1 }
                                 $utilizationPct = -1
+                                $utilizationWindowDays = 30
+                                $reservedHours = $null
+                                $usedHours = $null
+                                $unusedHours = $null
+                                $unusedCommitmentPercentage = $null
+                                $utilizationDataPoints = 0
+                                $utilizationSource = 'Unavailable'
                                 try {
-                                    $utilResp = Invoke-AzRestMethod -Path "$($ri.id)?api-version=2022-11-01&`$expand=utilization" -Method GET -ErrorAction SilentlyContinue
-                                    if ($utilResp.StatusCode -eq 200) {
-                                        $utilData = ($utilResp.Content | ConvertFrom-Json).properties.utilization
-                                        if ($utilData.aggregates) {
-                                            $avgUtil = $utilData.aggregates | Where-Object { $_.grain -eq 'Last7Days' -and $_.grainUnit -eq 'percentage' }
-                                            if ($avgUtil) { $utilizationPct = [math]::Round([double]$avgUtil.value, 1) }
-                                            else {
-                                                $anyAvg = $utilData.aggregates | Select-Object -First 1
-                                                if ($anyAvg) { $utilizationPct = [math]::Round([double]$anyAvg.value, 1) }
-                                            }
-                                        }
+                                    $endDate = (Get-Date).ToUniversalTime().Date
+                                    $startDate = $endDate.AddDays(-29)
+                                    $summaryFilter = [uri]::EscapeDataString("properties/UsageDate ge $($startDate.ToString('yyyy-MM-dd')) AND properties/UsageDate le $($endDate.ToString('yyyy-MM-dd'))")
+                                    $summaryPath = "$($ri.id)/providers/Microsoft.Consumption/reservationSummaries?api-version=2023-05-01&grain=daily&`$filter=$summaryFilter"
+                                    $summary = ConvertFrom-ReservationUtilizationSummary -InputObject @(Get-AzRestPagedValues -Path $summaryPath) -WindowDays 30
+                                    if ($summary.DataPoints -gt 0) {
+                                        $utilizationPct = $summary.UtilizationPct
+                                        $reservedHours = $summary.ReservedHours
+                                        $usedHours = $summary.UsedHours
+                                        $unusedHours = $summary.UnusedHours
+                                        $unusedCommitmentPercentage = $summary.UnusedCommitmentPercentage
+                                        $utilizationDataPoints = $summary.DataPoints
+                                        $utilizationSource = 'Azure Consumption reservation summaries'
                                     }
                                 } catch { }
+                                if ($utilizationPct -lt 0) {
+                                    $utilizationWindowDays = 7
+                                    try {
+                                        $utilResp = Invoke-AzRestMethodWithRetry -Path "$($ri.id)?api-version=2022-11-01&`$expand=utilization"
+                                        if ($utilResp.StatusCode -eq 200) {
+                                            $utilData = ($utilResp.Content | ConvertFrom-Json).properties.utilization
+                                            if ($utilData.aggregates) {
+                                                $avgUtil = $utilData.aggregates | Where-Object { $_.grain -eq 'Last7Days' -and $_.grainUnit -eq 'percentage' } | Select-Object -First 1
+                                                if (-not $avgUtil) { $avgUtil = $utilData.aggregates | Select-Object -First 1 }
+                                                if ($avgUtil) {
+                                                    $utilizationPct = [math]::Round([double]$avgUtil.value, [int]1)
+                                                    $unusedCommitmentPercentage = [math]::Round([double][math]::Max(0.0, 100.0 - $utilizationPct), [int]1)
+                                                    $utilizationDataPoints = 1
+                                                    $utilizationSource = 'Azure Capacity utilization aggregate'
+                                                }
+                                            }
+                                        }
+                                    } catch { }
+                                }
 
                                 $script:ReservationData.Add([PSCustomObject]@{
                                     Type            = 'Reservation'
@@ -4458,34 +4824,36 @@ function Analyze-Reservations {
                                     Term            = if ($props.term) { $props.term } else { 'N/A' }
                                     Status          = if ($props.provisioningState) { $props.provisioningState } else { 'Unknown' }
                                     UtilizationPct  = $utilizationPct
+                                    UtilizationWindowDays = $utilizationWindowDays
+                                    ReservedHours   = $reservedHours
+                                    UsedHours       = $usedHours
+                                    UnusedHours     = $unusedHours
+                                    UnusedCommitmentPercentage = $unusedCommitmentPercentage
+                                    UtilizationDataPoints = $utilizationDataPoints
+                                    UtilizationSource = $utilizationSource
                                     PurchaseDate    = $purchaseDate
                                     ExpiryDate      = $expiryDate
                                     DaysToExpiry    = $daysToExpiry
                                     Scope           = if ($props.appliedScopeType) { $props.appliedScopeType } else { 'N/A' }
                                     BenefitId       = $ri.id
-                                    Subscription    = $SubName
+                                    Subscription    = 'Tenant-wide'
+                                    SubscriptionId  = 'Tenant-wide'
                                 })
-                            }
                         }
                     } catch { }
                 }
-                Write-Status "  Reservation orders found: $($riOrders.Count)" "INFO"
-            }
+            Write-Status "  Reservation orders found: $($riOrders.Count)" "INFO"
         } catch {
             Write-Status "  Reservations API not accessible (requires Reservation Reader): $($_.Exception.Message)" "INFO"
         }
 
         # ── 2. Savings Plans ──
         try {
-            $spResp = Invoke-AzRestMethod -Path "/providers/Microsoft.BillingBenefits/savingsPlanOrders?api-version=2022-11-01" -Method GET -ErrorAction Stop
-            if ($spResp.StatusCode -eq 200) {
-                $spOrders = ($spResp.Content | ConvertFrom-Json).value
-                foreach ($spOrder in $spOrders) {
+            $spOrders = @(Get-AzRestPagedValues -Path "/providers/Microsoft.BillingBenefits/savingsPlanOrders?api-version=2022-11-01")
+            foreach ($spOrder in $spOrders) {
                     try {
-                        $spDetailResp = Invoke-AzRestMethod -Path "$($spOrder.id)/savingsPlans?api-version=2022-11-01" -Method GET -ErrorAction Stop
-                        if ($spDetailResp.StatusCode -eq 200) {
-                            $savingsPlans = ($spDetailResp.Content | ConvertFrom-Json).value
-                            foreach ($sp in $savingsPlans) {
+                        $savingsPlans = @(Get-AzRestPagedValues -Path "$($spOrder.id)/savingsPlans?api-version=2022-11-01")
+                        foreach ($sp in $savingsPlans) {
                                 $props = $sp.properties
                                 $expiryDate = if ($props.expiryDateTime) { [datetime]$props.expiryDateTime } else { $null }
                                 $purchaseDate = if ($props.purchaseDateTime) { [datetime]$props.purchaseDateTime } else { $null }
@@ -4506,22 +4874,29 @@ function Analyze-Reservations {
                                     Term            = if ($props.term) { $props.term } else { 'N/A' }
                                     Status          = if ($props.provisioningState) { $props.provisioningState } else { 'Unknown' }
                                     UtilizationPct  = $utilizationPct
+                                    UtilizationWindowDays = 7
+                                    ReservedHours   = $null
+                                    UsedHours       = $null
+                                    UnusedHours     = $null
+                                    UnusedCommitmentPercentage = if ($utilizationPct -ge 0) { [math]::Round([double][math]::Max(0.0, 100.0 - $utilizationPct), [int]1) } else { $null }
+                                    UtilizationDataPoints = if ($utilizationPct -ge 0) { 1 } else { 0 }
+                                    UtilizationSource = if ($utilizationPct -ge 0) { 'Azure Billing Benefits utilization aggregate' } else { 'Unavailable' }
                                     PurchaseDate    = $purchaseDate
                                     ExpiryDate      = $expiryDate
                                     DaysToExpiry    = $daysToExpiry
                                     Scope           = if ($props.appliedScopeType) { $props.appliedScopeType } else { 'N/A' }
                                     BenefitId       = $sp.id
-                                    Subscription    = $SubName
+                                    Subscription    = 'Tenant-wide'
+                                    SubscriptionId  = 'Tenant-wide'
                                 })
-                            }
                         }
                     } catch { }
                 }
-                Write-Status "  Savings Plan orders found: $($spOrders.Count)" "INFO"
-            }
+            Write-Status "  Savings Plan orders found: $($spOrders.Count)" "INFO"
         } catch {
             Write-Status "  Savings Plans API not accessible: $($_.Exception.Message)" "INFO"
         }
+        $script:ReservationInventoryLoaded = $true
     }
 
     # ── 3. Generate findings ──
@@ -4530,7 +4905,7 @@ function Analyze-Reservations {
 
     # No reservations at all
     $subCommitmentRecommendations = @($script:CommitmentRecommendations | Where-Object { $_.SubscriptionId -eq $SubId })
-    if ($script:ReservationData.Count -eq 0 -and $subCommitmentRecommendations.Count -eq 0) {
+    if (-not $SkipTenantInventory -and -not $TenantInventoryOnly -and $script:ReservationData.Count -eq 0 -and $subCommitmentRecommendations.Count -eq 0) {
         # Check if there are VMs or SQL that could benefit
         $vmCount = @($script:CachedVMs).Count
         $sqlCount = @($script:CachedSqlServers).Count
@@ -4544,16 +4919,22 @@ function Analyze-Reservations {
         }
     }
 
+    if ($SkipTenantInventory) {
+        Write-Status "  Subscription commitment analysis complete: $($subCommitmentRecommendations.Count) recommendation option(s)" "OK"
+        return
+    }
+
     # Low utilization reservations
     foreach ($ri in $riItems) {
         if ($ri.UtilizationPct -ge 0 -and $ri.UtilizationPct -lt 50) {
             $sev = if ($ri.UtilizationPct -lt 20) { 'High' } else { 'Medium' }
+            $usageDetail = if ($null -ne $ri.ReservedHours) { " Used $($ri.UsedHours) of $($ri.ReservedHours) reserved hours; $($ri.UnusedHours) hours were unused." } else { '' }
             Add-Finding -Pillar "Cost Optimization" -Severity $sev -Category "Cost - RI Low Utilization" `
                 -ResourceName "$($ri.DisplayName)" -ResourceType "Reservation ($($ri.ResourceType))" -ResourceGroup "N/A" `
                 -Subscription $ri.Subscription `
-                -Description "Reservation '$($ri.DisplayName)' ($($ri.ResourceType), SKU: $($ri.SKU)) has only $($ri.UtilizationPct)% utilization over the last 7 days. Quantity: $($ri.Quantity)." `
+                -Description "Reservation '$($ri.DisplayName)' ($($ri.ResourceType), SKU: $($ri.SKU)) has $($ri.UtilizationPct)% utilization over the last $($ri.UtilizationWindowDays) days. Quantity: $($ri.Quantity).$usageDetail" `
                 -Recommendation "Review if the reserved SKU matches deployed resources. Consider exchanging or changing the scope (Shared vs Single subscription)." `
-                -Impact "Underutilized reservations represent wasted commitment spend. At $($ri.UtilizationPct)% utilization, $(100 - $ri.UtilizationPct)% of the reservation cost is lost."
+                -Impact "$($ri.UnusedCommitmentPercentage)% of measured reserved capacity was unused. The monetary impact depends on the reservation purchase price and billing agreement."
         }
     }
 
@@ -5063,6 +5444,8 @@ resources
 function Analyze-BCDR {
     param([string]$SubId, [string]$SubName)
 
+    $assessmentNow = (Get-Date).ToUniversalTime()
+
     Write-Status "Analyzing Business Continuity & Disaster Recovery..." "SECTION"
 
     # ── Recovery Services Vaults (still needed for vault-level checks + cache for ResourceLocks) ──
@@ -5116,8 +5499,8 @@ function Analyze-BCDR {
                 $lastTime = $null
                 if ($item.lastBackupTime -is [datetime]) { $lastTime = $item.lastBackupTime }
                 else { try { $lastTime = [datetime]::Parse($item.lastBackupTime) } catch { $lastTime = $null } }
-                if ($lastTime -and $lastTime -lt (Get-Date).AddHours(-48)) {
-                    $hoursSince = [math]::Round(((Get-Date) - $lastTime).TotalHours, 0)
+                if ($lastTime -and $lastTime.ToUniversalTime() -lt $assessmentNow.AddHours(-48)) {
+                    $hoursSince = [math]::Round(($assessmentNow - $lastTime.ToUniversalTime()).TotalHours, 0)
                     Add-Finding -Pillar "Reliability" -Severity "Medium" -Category "BCDR - Stale Backup" `
                         -ResourceName $itemName -ResourceType "Backup Item" -ResourceGroup $rg `
                         -Subscription $SubName `
@@ -5244,8 +5627,8 @@ function Analyze-BCDR {
                             -Recommendation "Investigate the backup failure. Check VM agent status, disk snapshots, and vault storage capacity." `
                             -Impact "Failed backups leave the workload unprotected against data loss or disaster."
                     }
-                    if ($item.LastBackupTime -and $item.LastBackupTime -lt (Get-Date).AddHours(-48)) {
-                        $hoursSince = [math]::Round(((Get-Date) - $item.LastBackupTime).TotalHours, 0)
+                    if ($item.LastBackupTime -and $item.LastBackupTime.ToUniversalTime() -lt $assessmentNow.AddHours(-48)) {
+                        $hoursSince = [math]::Round(($assessmentNow - $item.LastBackupTime.ToUniversalTime()).TotalHours, 0)
                         Add-Finding -Pillar "Reliability" -Severity "Medium" -Category "BCDR - Stale Backup" `
                             -ResourceName $item.Name -ResourceType "Backup Item" -ResourceGroup $vault.ResourceGroupName `
                             -Subscription $SubName `
@@ -5762,31 +6145,48 @@ resources
 "@
 
     $mpResources = @()
-    try {
-        $mpResources = @(Search-AzGraph -Query $mpQuery -Subscription $SubId -First 1000 -ErrorAction Stop)
-    } catch {
-        Write-Status "  Resource Graph query for Marketplace failed, falling back to REST API" "WARN"
+    $marketplaceGraphSucceeded = $false
+    if ($null -ne $script:CachedResourceGraphResources) {
+        $mpResources = @($script:CachedResourceGraphResources | Where-Object {
+            $_.properties.marketplaceOrderId -or
+            ($_.plan.publisher -and $_.plan.publisher -notmatch '^Microsoft') -or
+            $_.type -match '^microsoft\.(saas|solutions)/'
+        } | ForEach-Object {
+            [PSCustomObject]@{
+                id = $_.id; name = $_.name; type = $_.type; resourceGroup = $_.resourceGroup; location = $_.location
+                publisher = if ($_.plan.publisher) { $_.plan.publisher } elseif ($_.properties.publisherId) { $_.properties.publisherId } else { 'Unknown' }
+                product = if ($_.plan.product) { $_.plan.product } elseif ($_.properties.offerId) { $_.properties.offerId } else { $_.name }
+                planName = if ($_.plan.name) { $_.plan.name } elseif ($_.properties.skuId) { $_.properties.skuId } else { 'N/A' }
+                planVer = if ($_.plan.version) { $_.plan.version } elseif ($_.properties.term) { $_.properties.term } else { 'N/A' }
+                provisioningState = [string]$_.properties.provisioningState
+                createdTime = [string]$_.properties.createdTime
+            }
+        })
+        $marketplaceGraphSucceeded = $true
+    } else {
+        try {
+            $mpResources = @(Search-AzGraph -Query $mpQuery -Subscription $SubId -First 1000 -ErrorAction Stop)
+            $marketplaceGraphSucceeded = $true
+        } catch {
+            Write-Status "  Resource Graph query for Marketplace failed, falling back to REST API" "WARN"
+        }
     }
 
     # ── Fallback: REST API to discover SaaS resources ──
     $saasResources = @()
-    try {
-        $saasResp = Invoke-AzRestMethod -Path "/subscriptions/$SubId/providers/Microsoft.SaaS/resources?api-version=2018-03-01-beta" -Method GET -ErrorAction Stop
-        if ($saasResp.StatusCode -eq 200) {
-            $saasData = ($saasResp.Content | ConvertFrom-Json).value
-            if ($saasData) { $saasResources = @($saasData) }
-        }
-    } catch { }
+    if (-not $marketplaceGraphSucceeded) {
+        try {
+            $saasResources = @(Get-AzRestPagedValues -Path "/subscriptions/$SubId/providers/Microsoft.SaaS/resources?api-version=2018-03-01-beta")
+        } catch { }
+    }
 
     # ── Fallback: List Managed Applications ──
     $managedApps = @()
-    try {
-        $maResp = Invoke-AzRestMethod -Path "/subscriptions/$SubId/providers/Microsoft.Solutions/applications?api-version=2021-07-01" -Method GET -ErrorAction Stop
-        if ($maResp.StatusCode -eq 200) {
-            $maData = ($maResp.Content | ConvertFrom-Json).value
-            if ($maData) { $managedApps = @($maData) }
-        }
-    } catch { }
+    if (-not $marketplaceGraphSucceeded) {
+        try {
+            $managedApps = @(Get-AzRestPagedValues -Path "/subscriptions/$SubId/providers/Microsoft.Solutions/applications?api-version=2021-07-01")
+        } catch { }
+    }
 
     $allMpItems = [System.Collections.Generic.List[PSCustomObject]]::new()
 
@@ -5981,8 +6381,9 @@ resources
         }
 
         # 6b. Full 6-month monthly breakdown by publisher (for trend charts)
-        $endDate = (Get-Date).ToString("yyyy-MM-dd")
-        $startDate = (Get-Date).AddMonths(-6).ToString("yyyy-MM-dd")
+        $marketplaceWindowEnd = (Get-Date).ToUniversalTime().Date
+        $endDate = $marketplaceWindowEnd.ToString("yyyy-MM-dd")
+        $startDate = $marketplaceWindowEnd.AddMonths(-6).ToString("yyyy-MM-dd")
         $mpMonthlyBody = @{
             type = "ActualCost"
             dataSet = @{
@@ -6096,8 +6497,12 @@ function Analyze-TagCompliance {
 
     $mandatoryTags = $MandatoryTags
 
-    # Get all resources in subscription
-    $resources = @(Get-AzResource -ErrorAction SilentlyContinue)
+    # Reuse the centralized inventory; fall back only when Resource Graph was unavailable.
+    if ($null -ne $script:CachedResourceGraphResources) {
+        $resources = @($script:CachedResourceGraphResources)
+    } else {
+        $resources = @(Get-AzResource -ErrorAction SilentlyContinue)
+    }
     $totalResources = $resources.Count
     if ($totalResources -eq 0) { Write-Status "  No resources found for tag analysis" "SKIP"; return }
 
@@ -6110,7 +6515,7 @@ function Analyze-TagCompliance {
         if (-not $resTags -or $resTags.Count -eq 0) {
             $untaggedCount++
         } else {
-            $missingTags = @($mandatoryTags | Where-Object { -not $resTags.ContainsKey($_) })
+            $missingTags = @($mandatoryTags | Where-Object { -not (Test-ObjectProperty -InputObject $resTags -Name $_) })
             if ($missingTags.Count -gt 0) {
                 $partialTaggedCount++
             }
@@ -6140,7 +6545,7 @@ function Analyze-TagCompliance {
     }
 
     # Check for RG-level tags (empty RG detection is handled in Analyze-SubscriptionHygiene)
-    $resourceGroups = @(Get-AzResourceGroup -ErrorAction SilentlyContinue)
+    $resourceGroups = @($script:CachedResourceGroups)
     foreach ($rg in $resourceGroups) {
         # Check RG-level tags
         if (-not $rg.Tags -or $rg.Tags.Count -eq 0) {
@@ -6197,15 +6602,22 @@ function Analyze-DiagnosticSettings {
 
     # Use Resource Graph to find resources that DO have diagnostic settings in one call
     $resourcesWithDiag = @{}
+    $diagnosticGraphSucceeded = $false
     try {
         Import-Module Az.ResourceGraph -ErrorAction SilentlyContinue
+        # Seed union with an empty valid table so tenants with zero diagnostic settings return successfully.
         $query = "resourcecontainers | where type =~ 'microsoft.resources/subscriptions' | take 0 | union (diagnosticsettings | where isnotempty(properties) | project resourceId = tolower(tostring(split(id, '/providers/microsoft.insights/diagnosticSettings')[0])), hasLAW = isnotempty(properties.workspaceId) | summarize hasLAW = max(hasLAW) by resourceId)"
-        $diagResults = Search-AzGraph -Query $query -Subscription $SubId -First 1000 -ErrorAction SilentlyContinue
-        if ($diagResults) {
-            foreach ($d in $diagResults) {
+        $skipToken = $null
+        do {
+            $params = @{ Query = $query; Subscription = $SubId; First = 1000; ErrorAction = 'Stop' }
+            if ($skipToken) { $params.SkipToken = $skipToken }
+            $diagResults = Search-AzGraph @params
+            foreach ($d in @($diagResults)) {
                 $resourcesWithDiag[$d.resourceId] = [bool]$d.hasLAW
             }
-        }
+            $skipToken = $diagResults.SkipToken
+        } while ($skipToken)
+        $diagnosticGraphSucceeded = $true
     } catch {
         # Resource Graph query for diagnosticSettings might not be available
     }
@@ -6213,8 +6625,8 @@ function Analyze-DiagnosticSettings {
     $totalChecked = 0
     $totalMissing = 0
 
-    # If Resource Graph returned results, use cached data + fast lookup
-    if ($resourcesWithDiag.Count -gt 0) {
+    # A successful empty result means no resources have diagnostics; it must not trigger N per-resource calls.
+    if ($diagnosticGraphSucceeded) {
         # Check cached resources by type
         foreach ($ct in $criticalTypes) {
             $resources = switch ($ct.Type) {
@@ -6227,17 +6639,24 @@ function Analyze-DiagnosticSettings {
                 'Microsoft.Storage/storageAccounts'              { $script:CachedStorageAccounts }
                 'Microsoft.Web/sites'                            { $script:CachedWebApps }
                 'Microsoft.Network/publicIPAddresses'            { $script:CachedPublicIPs }
-                default { @(Get-AzResource -ResourceType $ct.Type -ErrorAction SilentlyContinue) }
+                default {
+                    if ($null -ne $script:CachedResourceGraphResources) {
+                        @(Get-CachedResourceGraphResourcesByType $ct.Type)
+                    } else {
+                        @(Get-AzResource -ResourceType $ct.Type -ErrorAction SilentlyContinue)
+                    }
+                }
             }
             if (-not $resources) { continue }
             foreach ($res in $resources) {
                 $totalChecked++
-                $resId = ($res.Id).ToLower()
+                $resId = if ($res.Id) { $res.Id.ToLower() } else { ([string]$res.id).ToLower() }
+                $resourceGroupName = if ($res.ResourceGroupName) { $res.ResourceGroupName } else { $res.resourceGroup }
                 if ($resourcesWithDiag.ContainsKey($resId)) {
                     # Has diag settings — check if it sends to LAW
                     if (-not $resourcesWithDiag[$resId]) {
                         Add-Finding -Pillar "Operational Excellence" -Severity "Low" -Category "Diagnostic Settings - No Log Analytics" `
-                            -ResourceName $res.Name -ResourceType $ct.Type -ResourceGroup $res.ResourceGroupName `
+                            -ResourceName $res.Name -ResourceType $ct.Type -ResourceGroup $resourceGroupName `
                             -Subscription $SubName `
                             -Description "Diagnostic settings exist but none send to Log Analytics workspace." `
                             -Recommendation "Add a diagnostic setting targeting a Log Analytics workspace for queryable log analysis and Sentinel integration." `
@@ -6246,7 +6665,7 @@ function Analyze-DiagnosticSettings {
                 } else {
                     $totalMissing++
                     Add-Finding -Pillar "Operational Excellence" -Severity $ct.Severity -Category "Diagnostic Settings - $($ct.Label)" `
-                        -ResourceName $res.Name -ResourceType $ct.Type -ResourceGroup $res.ResourceGroupName `
+                        -ResourceName $res.Name -ResourceType $ct.Type -ResourceGroup $resourceGroupName `
                         -Subscription $SubName `
                         -Description "No diagnostic settings configured. Logs and metrics are not being collected." `
                         -Recommendation "Enable diagnostic settings to send logs to Log Analytics workspace for monitoring, alerting, and incident investigation." `
@@ -6327,8 +6746,8 @@ function Analyze-PrivateEndpoints {
         @{ Type = 'Microsoft.ServiceBus/namespaces';             Label = 'Service Bus';       GetPublic = { param($r) $true } }
     )
 
-    # Get all private endpoints in the subscription to cross-reference
-    $privateEndpoints = @(Get-AzPrivateEndpoint -ErrorAction SilentlyContinue)
+    # Reuse the centralized private endpoint collection.
+    $privateEndpoints = @($script:CachedPrivateEndpoints)
     $peTargetIds = @($privateEndpoints | ForEach-Object { $_.PrivateLinkServiceConnections | ForEach-Object { $_.PrivateLinkServiceId } }) | Where-Object { $_ }
 
     $totalPaaS = 0
@@ -6337,10 +6756,15 @@ function Analyze-PrivateEndpoints {
 
     foreach ($check in $paasChecks) {
         try {
-            $resources = @(Get-AzResource -ResourceType $check.Type -ErrorAction SilentlyContinue)
+            if ($null -ne $script:CachedResourceGraphResources) {
+                $resources = @(Get-CachedResourceGraphResourcesByType $check.Type)
+            } else {
+                $resources = @(Get-AzResource -ResourceType $check.Type -ErrorAction SilentlyContinue)
+            }
             foreach ($res in $resources) {
                 $totalPaaS++
-                $hasPE = $peTargetIds -contains $res.ResourceId
+                $resourceId = if ($res.ResourceId) { $res.ResourceId } else { $res.id }
+                $hasPE = $peTargetIds -contains $resourceId
 
                 if (-not $hasPE) {
                     $withoutPE++
@@ -6359,7 +6783,7 @@ function Analyze-PrivateEndpoints {
                     }
 
                     Add-Finding -Pillar "Security" -Severity $sev -Category "Private Endpoint - $($check.Label)" `
-                        -ResourceName $res.Name -ResourceType $check.Type -ResourceGroup $res.ResourceGroupName `
+                        -ResourceName $res.Name -ResourceType $check.Type -ResourceGroup $(if ($res.ResourceGroupName) { $res.ResourceGroupName } else { $res.resourceGroup }) `
                         -Subscription $SubName `
                         -Description "$($check.Label) '$($res.Name)' has no Private Endpoint. Traffic traverses public internet." `
                         -Recommendation "Create a Private Endpoint to route traffic over the Microsoft backbone network. Disable public access after PE is configured." `
@@ -6440,7 +6864,7 @@ function Analyze-PolicyCompliance {
             # Fallback to REST API
             $complianceUrl = "/subscriptions/$SubId/providers/Microsoft.PolicyInsights/policyStates/latest/summarize?api-version=2019-10-01"
             try {
-                $complianceResult = Invoke-AzRestMethod -Path $complianceUrl -Method POST -ErrorAction Stop
+                $complianceResult = Invoke-AzRestMethodWithRetry -Path $complianceUrl -Method POST
                 if ($complianceResult.StatusCode -ne 200) { throw "Policy Insights API returned $($complianceResult.StatusCode)" }
                 $complianceData = ($complianceResult.Content | ConvertFrom-Json).value
 
@@ -6524,11 +6948,10 @@ function Analyze-CosmosOSSDatabase {
 
     # --- Cosmos DB ---
     try {
-        $cosmosAccounts = @(Get-AzResource -ResourceType 'Microsoft.DocumentDB/databaseAccounts' -ErrorAction SilentlyContinue)
+        $cosmosAccounts = @(Get-CachedResourceDetailsByType 'microsoft.documentdb/databaseaccounts')
         foreach ($cosmos in $cosmosAccounts) {
             try {
-                $cosmosDetail = Get-AzResource -ResourceId $cosmos.ResourceId -ExpandProperties -ErrorAction SilentlyContinue
-                $props = $cosmosDetail.Properties
+            $props = $cosmos.Properties
 
                 # Public network access
                 if ($props.publicNetworkAccess -ne 'Disabled') {
@@ -6582,11 +7005,10 @@ function Analyze-CosmosOSSDatabase {
 
     # --- PostgreSQL Flexible Server ---
     try {
-        $pgServers = @(Get-AzResource -ResourceType 'Microsoft.DBforPostgreSQL/flexibleServers' -ErrorAction SilentlyContinue)
+        $pgServers = @(Get-CachedResourceDetailsByType 'microsoft.dbforpostgresql/flexibleservers')
         foreach ($pg in $pgServers) {
             try {
-                $pgDetail = Get-AzResource -ResourceId $pg.ResourceId -ExpandProperties -ErrorAction SilentlyContinue
-                $props = $pgDetail.Properties
+            $props = $pg.Properties
 
                 # Public access
                 if ($props.network.publicNetworkAccess -ne 'Disabled') {
@@ -6624,11 +7046,10 @@ function Analyze-CosmosOSSDatabase {
 
     # --- MySQL Flexible Server ---
     try {
-        $mysqlServers = @(Get-AzResource -ResourceType 'Microsoft.DBforMySQL/flexibleServers' -ErrorAction SilentlyContinue)
+        $mysqlServers = @(Get-CachedResourceDetailsByType 'microsoft.dbformysql/flexibleservers')
         foreach ($mysql in $mysqlServers) {
             try {
-                $mysqlDetail = Get-AzResource -ResourceId $mysql.ResourceId -ExpandProperties -ErrorAction SilentlyContinue
-                $props = $mysqlDetail.Properties
+            $props = $mysql.Properties
 
                 if ($props.network.publicNetworkAccess -ne 'Disabled') {
                     Add-Finding -Pillar "Security" -Severity "High" -Category "MySQL - Public Access" `
@@ -6653,11 +7074,10 @@ function Analyze-CosmosOSSDatabase {
 
     # --- Redis Cache ---
     try {
-        $redisInstances = @(Get-AzResource -ResourceType 'Microsoft.Cache/redis' -ErrorAction SilentlyContinue)
+        $redisInstances = @(Get-CachedResourceDetailsByType 'microsoft.cache/redis')
         foreach ($redis in $redisInstances) {
             try {
-                $redisDetail = Get-AzResource -ResourceId $redis.ResourceId -ExpandProperties -ErrorAction SilentlyContinue
-                $props = $redisDetail.Properties
+            $props = $redis.Properties
 
                 # Non-SSL port enabled
                 if ($props.enableNonSslPort -eq $true) {
@@ -6702,9 +7122,18 @@ function Analyze-SubscriptionHygiene {
     param([string]$SubId, [string]$SubName)
     Write-Status "  Analyzing subscription hygiene..." "INFO"
 
-    # Get all resources and resource groups
-    $resources = @(Get-AzResource -ErrorAction SilentlyContinue)
-    $resourceGroups = @(Get-AzResourceGroup -ErrorAction SilentlyContinue)
+    # Reuse centralized inventory and resource-group cache.
+    if ($null -ne $script:CachedResourceGraphResources) {
+        $resources = @($script:CachedResourceGraphResources | ForEach-Object {
+            [PSCustomObject]@{
+                Name = $_.name; Location = $_.location; ResourceGroupName = $_.resourceGroup
+                ResourceType = $_.type; Tags = $_.tags; ResourceId = $_.id
+            }
+        })
+    } else {
+        $resources = @(Get-AzResource -ErrorAction SilentlyContinue)
+    }
+    $resourceGroups = @($script:CachedResourceGroups)
 
     # Region distribution analysis
     $regionGroups = $resources | Group-Object Location | Sort-Object Count -Descending
@@ -7152,11 +7581,8 @@ function Analyze-AdditionalChecks {
     # ── 10. Orphaned managed identities with role assignments ──
     Write-Status "  [10/12] Orphaned identity assignments..." "INFO"
     if ($script:CachedRoleAssignments.ContainsKey($SubId)) {
-        $spAssignments = @($script:CachedRoleAssignments[$SubId] | Where-Object {
-            $_.properties.principalType -eq 'ServicePrincipal'
-        })
         $unknownAssignments = @($script:CachedRoleAssignments[$SubId] | Where-Object {
-            -not $_.properties.principalType -or $_.properties.principalType -eq 'Unknown'
+            -not $_.principalType -or $_.principalType -eq 'Unknown'
         })
         if ($unknownAssignments.Count -gt 0) {
             Add-Finding -Pillar "Security" -Severity "Medium" `
@@ -7369,6 +7795,451 @@ function Analyze-AdditionalChecks {
     # Skipped here as it requires metric API calls not in cache
 
     Write-Status "  All cached-data checks complete (21 total)" "OK"
+}
+
+# ============================================================================
+# OPTIONAL GITHUB AND COPILOT ADOPTION ASSESSMENT
+# ============================================================================
+function ConvertTo-PlainTextToken {
+    param([object]$Token)
+    if ($null -eq $Token) { return $null }
+    if ($Token -isnot [System.Security.SecureString]) { return [string]$Token }
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Token)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
+}
+
+function Get-GitHubRequestHeaders {
+    $token = if ($env:GH_TOKEN) { [string]$env:GH_TOKEN } else { [string]$env:GITHUB_TOKEN }
+    if (-not $token -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+        try { $token = [string](& gh auth token 2>$null) } catch { }
+    }
+    if (-not $token) { return $null }
+    return @{ Authorization = "Bearer $token"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2026-03-10' }
+}
+
+function Invoke-ExternalRequestWithRetry {
+    param(
+        [Parameter(Mandatory=$true)][scriptblock]$Request,
+        [string]$Operation = 'External API request',
+        [ValidateRange(1, 6)][int]$MaxAttempts = 4,
+        [ValidateRange(0, 60)][int]$BaseDelaySeconds = 2
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return & $Request
+        } catch {
+            $statusCode = $null
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { }
+            $isTransient = $statusCode -in @(408, 429, 500, 502, 503, 504) -or $_.Exception.Message -match '429|Too Many Requests|timeout|temporar|502|503|504'
+            if (-not $isTransient -or $attempt -eq $MaxAttempts) { throw }
+
+            $retryAfter = 0
+            try {
+                $retryAfterDelta = $_.Exception.Response.Headers.RetryAfter.Delta
+                if ($retryAfterDelta) { $retryAfter = [int][math]::Ceiling($retryAfterDelta.TotalSeconds) }
+            } catch { }
+            if ($retryAfter -le 0) { $retryAfter = [math]::Min(60, $BaseDelaySeconds * [math]::Pow(2, $attempt - 1)) }
+            if (Get-Command Write-Status -ErrorAction SilentlyContinue) {
+                Write-Status "  $Operation throttled or temporarily unavailable. Retry $($attempt + 1)/$MaxAttempts in $retryAfter seconds..." "WARN"
+            }
+            if ($retryAfter -gt 0) { Start-Sleep -Seconds $retryAfter }
+        }
+    }
+}
+
+function ConvertFrom-GitHubCopilotReport {
+    param([Parameter(Mandatory=$true)]$Report, [string]$Organization)
+    $normalizedReport = [System.Collections.Generic.List[object]]::new()
+    foreach ($reportItem in @($Report)) {
+        if ($reportItem -is [string]) {
+            foreach ($line in @($reportItem -split "`r?`n" | Where-Object { $_.Trim() })) {
+                try {
+                    $parsed = $line | ConvertFrom-Json -ErrorAction Stop
+                    foreach ($item in @($parsed)) { $normalizedReport.Add($item) }
+                } catch { }
+            }
+        } else {
+            $normalizedReport.Add($reportItem)
+        }
+    }
+    $dayTotals = @($normalizedReport | ForEach-Object { @($_.day_totals) })
+    $latest = $dayTotals | Where-Object { $_ } | Sort-Object day -Descending | Select-Object -First 1
+    if (-not $latest) { return $null }
+    $generated = [double]$latest.code_generation_activity_count
+    $accepted = [double]$latest.code_acceptance_activity_count
+    [PSCustomObject]@{
+        Organization = $Organization
+        Day = [string]$latest.day
+        DailyActiveUsers = [int]$latest.daily_active_users
+        WeeklyActiveUsers = [int]$latest.weekly_active_users
+        MonthlyActiveUsers = [int]$latest.monthly_active_users
+        CodeGenerations = $generated
+        CodeAcceptances = $accepted
+        AcceptanceRate = if ($generated -gt 0) { [math]::Round(($accepted / $generated) * 100, 1) } else { $null }
+        LinesSuggested = [double]$latest.loc_suggested_to_add_sum
+        LinesAdded = [double]$latest.loc_added_sum
+        ChatUsers = [int]$latest.monthly_active_chat_users
+        AgentUsers = [int]$latest.monthly_active_agent_users
+        CodeReviewUsers = [int]$latest.monthly_active_copilot_code_review_users
+    }
+}
+
+function Invoke-GitHubAdoptionAssessment {
+    $organizations = @($GitHubOrganization | Where-Object { $_ } | Select-Object -Unique)
+    if ($organizations.Count -eq 0) { return }
+    Write-Status "Assessing GitHub organization governance..." "SECTION"
+    $headers = Get-GitHubRequestHeaders
+    if (-not $headers) {
+        Write-Status "GitHub assessment unavailable. Set GITHUB_TOKEN or run 'gh auth login'." "WARN"
+        $script:AdoptionData.GitHub = @([PSCustomObject]@{ Status = 'Unavailable'; Reason = 'Authentication not configured' })
+        return
+    }
+
+    foreach ($organization in $organizations) {
+        try {
+            $org = Invoke-ExternalRequestWithRetry -Operation "GitHub organization request" -Request {
+                Invoke-RestMethod -Uri "https://api.github.com/orgs/$([uri]::EscapeDataString($organization))" -Headers $headers -Method Get -ErrorAction Stop
+            }
+            $orgResult = [PSCustomObject]@{
+                Organization = $organization
+                Status = 'Available'
+                TwoFactorRequirementEnabled = $org.two_factor_requirement_enabled
+                DefaultRepositoryPermission = [string]$org.default_repository_permission
+                MembersCanCreatePublicRepositories = $org.members_can_create_public_repositories
+                PublicRepositories = [int]$org.public_repos
+            }
+            $script:AdoptionData.GitHub = @($script:AdoptionData.GitHub) + $orgResult
+            if ($null -ne $orgResult.TwoFactorRequirementEnabled -and -not [bool]$orgResult.TwoFactorRequirementEnabled) {
+                Add-Finding -Pillar "Security" -Severity "High" -Category "GitHub - Two-Factor Authentication" `
+                    -ResourceName $organization -ResourceType "GitHub Organization" -ResourceGroup "N/A" -Subscription "Tenant-wide" `
+                    -Description "The GitHub organization does not require two-factor authentication." `
+                    -Recommendation "Require two-factor authentication or enterprise managed users for all organization members." `
+                    -Impact "Compromised developer credentials can expose source code, workflows, and deployment credentials."
+            }
+            if ($null -ne $orgResult.MembersCanCreatePublicRepositories -and [bool]$orgResult.MembersCanCreatePublicRepositories) {
+                Add-Finding -Pillar "Security" -Severity "Medium" -Category "GitHub - Public Repository Creation" `
+                    -ResourceName $organization -ResourceType "GitHub Organization" -ResourceGroup "N/A" -Subscription "Tenant-wide" `
+                    -Description "Organization members are permitted to create public repositories." `
+                    -Recommendation "Restrict public repository creation and require an approval process for intentional open-source publishing." `
+                    -Impact "Source code or sensitive configuration can be published accidentally."
+            }
+
+            if ($IncludeGitHubCopilot) {
+                try {
+                    $indexUri = "https://api.github.com/orgs/$([uri]::EscapeDataString($organization))/copilot/metrics/reports/organization-28-day/latest"
+                    $reportIndex = Invoke-ExternalRequestWithRetry -Operation "GitHub Copilot report index" -Request {
+                        Invoke-RestMethod -Uri $indexUri -Headers $headers -Method Get -ErrorAction Stop
+                    }
+                    $reportItems = [System.Collections.Generic.List[object]]::new()
+                    foreach ($downloadLink in @($reportIndex.download_links)) {
+                        $downloaded = Invoke-ExternalRequestWithRetry -Operation "GitHub Copilot report download" -Request {
+                            Invoke-RestMethod -Uri $downloadLink -Method Get -ErrorAction Stop
+                        }
+                        foreach ($item in @($downloaded)) { $reportItems.Add($item) }
+                    }
+                    $summary = ConvertFrom-GitHubCopilotReport -Report @($reportItems) -Organization $organization
+                    if ($summary) {
+                        $script:AdoptionData.GitHubCopilot = @($script:AdoptionData.GitHubCopilot) + $summary
+                        Add-Finding -Pillar "Operational Excellence" -Severity "Info" -Category "GitHub Copilot - Usage Summary" `
+                            -ResourceName $organization -ResourceType "GitHub Copilot" -ResourceGroup "N/A" -Subscription "Tenant-wide" `
+                            -Description "Latest usage: $($summary.MonthlyActiveUsers) monthly active users, $($summary.CodeGenerations) code generations, $($summary.CodeAcceptances) acceptances, acceptance rate $(if ($null -ne $summary.AcceptanceRate) { "$($summary.AcceptanceRate)%" } else { 'N/A' })." `
+                            -Recommendation "Track adoption by team and repository while protecting individual privacy and avoiding productivity conclusions from a single metric." `
+                            -Impact "Aggregated adoption metrics help target enablement and evaluate Copilot usage trends."
+                        if ($summary.MonthlyActiveUsers -eq 0) {
+                            Add-Finding -Pillar "Operational Excellence" -Severity "Medium" -Category "GitHub Copilot - No Active Users" `
+                                -ResourceName $organization -ResourceType "GitHub Copilot" -ResourceGroup "N/A" -Subscription "Tenant-wide" `
+                                -Description "The latest Copilot report contains no monthly active users." `
+                                -Recommendation "Validate seat assignment, policy enablement, onboarding, and developer access." `
+                                -Impact "Licensed AI development capability may not be producing adoption or productivity value."
+                        } elseif ($null -ne $summary.AcceptanceRate -and $summary.AcceptanceRate -lt 20) {
+                            Add-Finding -Pillar "Operational Excellence" -Severity "Low" -Category "GitHub Copilot - Low Acceptance" `
+                                -ResourceName $organization -ResourceType "GitHub Copilot" -ResourceGroup "N/A" -Subscription "Tenant-wide" `
+                                -Description "The latest code activity acceptance rate is $($summary.AcceptanceRate)%." `
+                                -Recommendation "Review enablement, prompt practices, language coverage, IDE versions, and team-specific adoption patterns." `
+                                -Impact "Low acceptance can indicate limited relevance, enablement gaps, or workflow friction."
+                        }
+                    } else {
+                        Write-Status "GitHub Copilot returned no aggregate usage rows for $organization" "WARN"
+                        $script:AdoptionData.GitHubCopilot = @($script:AdoptionData.GitHubCopilot) + [PSCustomObject]@{ Organization = $organization; Status = 'Unavailable'; Reason = 'No aggregate usage rows returned' }
+                    }
+                } catch {
+                    Write-Status "GitHub Copilot metrics unavailable for $organization`: $($_.Exception.Message)" "WARN"
+                    $script:AdoptionData.GitHubCopilot = @($script:AdoptionData.GitHubCopilot) + [PSCustomObject]@{ Organization = $organization; Status = 'Unavailable'; Reason = $_.Exception.Message }
+                }
+            }
+        } catch {
+            Write-Status "GitHub organization assessment unavailable for $organization`: $($_.Exception.Message)" "WARN"
+            $script:AdoptionData.GitHub = @($script:AdoptionData.GitHub) + [PSCustomObject]@{ Organization = $organization; Status = 'Unavailable'; Reason = $_.Exception.Message }
+        }
+    }
+}
+
+function Invoke-M365CopilotAdoptionAssessment {
+    if (-not $IncludeM365Copilot) { return }
+    Write-Status "Assessing Microsoft 365 Copilot adoption..." "SECTION"
+    try {
+        $uri = "https://graph.microsoft.com/v1.0/copilot/reports/getMicrosoft365CopilotUserCountSummary(period='$CopilotUsagePeriod',version='v2')?`$format=text/csv"
+        $content = $null
+        $mgContext = if (Get-Command Get-MgContext -ErrorAction SilentlyContinue) { Get-MgContext -ErrorAction SilentlyContinue } else { $null }
+        if ($mgContext -and $mgContext.Scopes -contains 'Reports.Read.All' -and (Get-Command Invoke-MgGraphRequest -ErrorAction SilentlyContinue)) {
+            $graphResponse = Invoke-ExternalRequestWithRetry -Operation "Microsoft Graph Copilot report" -Request {
+                Invoke-MgGraphRequest -Uri $uri -Method GET -OutputType HttpResponseMessage -ErrorAction Stop
+            }
+            $content = $graphResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        } else {
+            $token = [string]$env:M365_COPILOT_ACCESS_TOKEN
+            if (-not $token) {
+                $tokenResult = Get-AzAccessToken -ResourceTypeName MSGraph -ErrorAction Stop
+                $token = ConvertTo-PlainTextToken $tokenResult.Token
+            }
+            if (-not $token) { throw 'No Microsoft Graph access token is available.' }
+            $response = Invoke-ExternalRequestWithRetry -Operation "Microsoft Graph Copilot report" -Request {
+                Invoke-WebRequest -Uri $uri -Headers @{ Authorization = "Bearer $token" } -Method Get -ErrorAction Stop
+            }
+            $content = $response.Content
+        }
+        $rows = @($content | ConvertFrom-Csv)
+        $row = $rows | Select-Object -First 1
+        if (-not $row) { throw 'Microsoft Graph returned an empty Copilot usage report.' }
+        $enabled = [int](Get-FirstPropertyValue $row @('Microsoft 365 Copilot Enabled Users','Any App Enabled Users'))
+        $active = [int](Get-FirstPropertyValue $row @('Microsoft 365 Copilot Active Users','Any App Active Users'))
+        $adoptionRate = if ($enabled -gt 0) { [math]::Round(($active / $enabled) * 100, 1) } else { $null }
+        $script:AdoptionData.Microsoft365Copilot = [PSCustomObject]@{
+            Status = 'Available'
+            Period = $CopilotUsagePeriod
+            EnabledUsers = $enabled
+            ActiveUsers = $active
+            AdoptionRate = $adoptionRate
+            ReportRefreshDate = Get-FirstPropertyValue $row @('Report Refresh Date')
+            TeamsActiveUsers = [int](Get-FirstPropertyValue $row @('Microsoft Teams Active Users'))
+            WordActiveUsers = [int](Get-FirstPropertyValue $row @('Word Active Users'))
+            ExcelActiveUsers = [int](Get-FirstPropertyValue $row @('Excel Active Users'))
+            OutlookActiveUsers = [int](Get-FirstPropertyValue $row @('Outlook Active Users'))
+            CopilotChatActiveUsers = [int](Get-FirstPropertyValue $row @('Copilot Chat Active Users','Copilot Chat (work) Active Users'))
+        }
+        Add-Finding -Pillar "Operational Excellence" -Severity "Info" -Category "Microsoft 365 Copilot - Adoption Summary" `
+            -ResourceName "$active of $enabled active users" -ResourceType "Microsoft 365 Copilot" -ResourceGroup "N/A" -Subscription "Tenant-wide" `
+            -Description "Microsoft 365 Copilot adoption is $(if ($null -ne $adoptionRate) { "$adoptionRate%" } else { 'N/A' }) for $CopilotUsagePeriod." `
+            -Recommendation "Track adoption by persona and application while preserving user privacy and combining telemetry with qualitative outcomes." `
+            -Impact "Aggregate adoption trends help optimize licensing and enablement investments."
+        if ($enabled -gt 0 -and $active -eq 0) {
+            Add-Finding -Pillar "Cost Optimization" -Severity "High" -Category "Microsoft 365 Copilot - No Active Users" `
+                -ResourceName "$enabled enabled users" -ResourceType "Microsoft 365 Copilot" -ResourceGroup "N/A" -Subscription "Tenant-wide" `
+                -Description "$enabled users are enabled but none were active during $CopilotUsagePeriod." `
+                -Recommendation "Validate license assignment, readiness, communications, training, and access to grounding data." `
+                -Impact "Unused licenses create cost without measurable adoption."
+        } elseif ($null -ne $adoptionRate -and $adoptionRate -lt 30) {
+            Add-Finding -Pillar "Cost Optimization" -Severity "Medium" -Category "Microsoft 365 Copilot - Low Adoption" `
+                -ResourceName "$active of $enabled active users" -ResourceType "Microsoft 365 Copilot" -ResourceGroup "N/A" -Subscription "Tenant-wide" `
+                -Description "Microsoft 365 Copilot adoption is $adoptionRate% for $CopilotUsagePeriod." `
+                -Recommendation "Target enablement by persona, validate license allocation, and track adoption by application before expanding seats." `
+                -Impact "Low adoption reduces return on Copilot licensing investment."
+        }
+    } catch {
+        Write-Status "Microsoft 365 Copilot report unavailable: $($_.Exception.Message)" "WARN"
+        $script:AdoptionData.Microsoft365Copilot = [PSCustomObject]@{ Status = 'Unavailable'; Period = $CopilotUsagePeriod; Reason = $_.Exception.Message }
+    }
+}
+
+function Invoke-OptionalAdoptionAnalysis {
+    if ($IncludeGitHubCopilot -and @($GitHubOrganization | Where-Object { $_ }).Count -eq 0) {
+        Write-Status "GitHub Copilot metrics requested but -GitHubOrganization was not provided" "WARN"
+    }
+    if (@($GitHubOrganization | Where-Object { $_ }).Count -gt 0) {
+        $script:Findings = [System.Collections.Generic.List[PSCustomObject]]@($script:Findings | Where-Object { $_.Category -notlike 'GitHub*' })
+        $script:StepResults = [System.Collections.Generic.List[PSCustomObject]]@($script:StepResults | Where-Object { $_.Step -ne 'GitHubGovernance' })
+        $script:AdoptionData.GitHub = @()
+        $script:AdoptionData.GitHubCopilot = @()
+        Invoke-AnalysisStep "GitHubGovernance" "" "Tenant-wide" { Invoke-GitHubAdoptionAssessment }
+    }
+    if ($IncludeM365Copilot) {
+        $script:Findings = [System.Collections.Generic.List[PSCustomObject]]@($script:Findings | Where-Object { $_.Category -notlike 'Microsoft 365 Copilot*' })
+        $script:StepResults = [System.Collections.Generic.List[PSCustomObject]]@($script:StepResults | Where-Object { $_.Step -ne 'M365CopilotAdoption' })
+        $script:AdoptionData.Microsoft365Copilot = $null
+        Invoke-AnalysisStep "M365CopilotAdoption" "" "Tenant-wide" { Invoke-M365CopilotAdoptionAssessment }
+    }
+    if (@($GitHubOrganization | Where-Object { $_ }).Count -gt 0 -or $IncludeM365Copilot) {
+        Save-TenantCheckpoint
+        Write-PartialAssessmentReport
+    }
+}
+
+# ============================================================================
+# AZURE AI FOUNDRY / AI SERVICES ASSESSMENT
+# ============================================================================
+function Analyze-AIFoundry {
+    param([string]$SubId, [string]$SubName)
+    Write-Status "  Analyzing Azure AI Foundry and AI Services..." "INFO"
+
+    if ($null -eq $script:CachedResourceGraphResources) {
+        Write-Status "  AI analysis skipped because Resource Graph inventory is unavailable" "SKIP"
+        return
+    }
+
+    $aiResources = @($script:CachedResourceGraphResources | Where-Object {
+        $type = ([string]$_.type).ToLowerInvariant()
+        $kind = [string]$_.kind
+        $type -eq 'microsoft.cognitiveservices/accounts' -or
+        $type -like 'microsoft.cognitiveservices/accounts/*' -or
+        ($type -eq 'microsoft.machinelearningservices/workspaces' -and $kind -match 'hub|project|featurestore')
+    })
+    if ($aiResources.Count -eq 0) {
+        Write-Status "  No Azure AI Foundry or AI Services resources detected" "SKIP"
+        return
+    }
+
+    foreach ($resource in $aiResources) {
+        $resourceType = [string]$resource.type
+        $resourceGroup = [string]$resource.resourceGroup
+        $kind = if ($resource.kind) { [string]$resource.kind } else { 'AI resource' }
+        $properties = $resource.properties
+        $isAccount = $resourceType -ieq 'microsoft.cognitiveservices/accounts'
+        $isWorkspace = $resourceType -ieq 'microsoft.machinelearningservices/workspaces'
+        $isDeployment = $resourceType -imatch '/deployments$'
+        $model = if ($isDeployment -and $properties.model) { [string]$properties.model.name } else { '' }
+        $modelVersion = if ($isDeployment -and $properties.model) { [string]$properties.model.version } else { '' }
+
+        $script:AIServiceInventory.Add([PSCustomObject]@{
+            SubscriptionId = $SubId
+            Subscription = $SubName
+            ResourceId = [string]$resource.id
+            Name = [string]$resource.name
+            ResourceGroup = $resourceGroup
+            ResourceType = $resourceType
+            Kind = $kind
+            Location = [string]$resource.location
+            Sku = [string]$resource.sku.name
+            Model = $model
+            ModelVersion = $modelVersion
+            Capacity = if ($resource.sku) { $resource.sku.capacity } else { $null }
+        })
+
+        if (-not ($isAccount -or $isWorkspace)) { continue }
+
+        $publicNetworkAccess = [string]$properties.publicNetworkAccess
+        $networkDefaultAction = [string]$properties.networkAcls.defaultAction
+        if ($publicNetworkAccess -ne 'Disabled' -and $networkDefaultAction -ne 'Deny') {
+            Add-Finding -Pillar "Security" -Severity "Medium" -Category "AI - Public Network Access" `
+                -ResourceName $resource.name -ResourceType $resourceType -ResourceGroup $resourceGroup -Subscription $SubName `
+                -Description "$kind resource permits public network connectivity or does not enforce a default-deny network ACL." `
+                -Recommendation "Use Private Endpoints and set publicNetworkAccess to Disabled, or restrict network ACLs to explicitly approved networks." `
+                -Impact "Public AI endpoints increase exposure of model APIs and sensitive prompts or responses."
+        }
+
+        if ($isAccount -and $properties.disableLocalAuth -ne $true) {
+            Add-Finding -Pillar "Security" -Severity "Medium" -Category "AI - Local Authentication Enabled" `
+                -ResourceName $resource.name -ResourceType $resourceType -ResourceGroup $resourceGroup -Subscription $SubName `
+                -Description "$kind resource permits key-based local authentication." `
+                -Recommendation "Use Microsoft Entra ID and managed identities, then set disableLocalAuth to true after validating application compatibility." `
+                -Impact "Long-lived access keys increase credential leakage and rotation risk."
+        }
+
+        if (-not $resource.identity -or -not $resource.identity.type -or [string]$resource.identity.type -eq 'None') {
+            Add-Finding -Pillar "Security" -Severity "Low" -Category "AI - Managed Identity" `
+                -ResourceName $resource.name -ResourceType $resourceType -ResourceGroup $resourceGroup -Subscription $SubName `
+                -Description "$kind resource does not have a managed identity enabled." `
+                -Recommendation "Enable a system-assigned or user-assigned managed identity and use identity-based access to dependent Azure services." `
+                -Impact "Applications may rely on embedded credentials instead of short-lived identity tokens."
+        }
+
+        if ($IncludeAIMetrics -and -not $SkipMetrics -and $isAccount) {
+            try {
+                $metricDefinitions = @(Get-AzMetricDefinition -ResourceId $resource.id -ErrorAction Stop)
+                $availableNames = @($metricDefinitions | ForEach-Object { [string]$_.Name.Value })
+                $desiredNames = @(
+                    'AzureOpenAIRequests', 'ModelRequests', 'GeneratedTokens', 'ProcessedPromptTokens',
+                    'TokenTransaction', 'InputTokens', 'OutputTokens', 'TotalTokens',
+                    'AzureOpenAINormalizedTTFTInMS', 'NormalizedTimeToFirstToken',
+                    'AzureOpenAITimeToResponse', 'TimeToResponse',
+                    'AzureOpenAIProvisionedManagedUtilizationV2', 'ProvisionedUtilization',
+                    'AzureOpenAIAvailabilityRate', 'ModelAvailabilityRate',
+                    'RAIRejectedRequests', 'RAIHarmfulRequests', 'BlockedCalls', 'TotalCalls'
+                ) | Where-Object { $_ -in $availableNames }
+
+                if ($desiredNames.Count -gt 0) {
+                    $endTime = Get-Date
+                    $startTime = $endTime.AddDays(-$MetricDays)
+                    $metrics = @(Get-AzMetric -ResourceId $resource.id -MetricName $desiredNames `
+                        -StartTime $startTime -EndTime $endTime -TimeGrain ([timespan]::FromHours(1)) `
+                        -WarningAction SilentlyContinue -ErrorAction Stop)
+                    $metricValues = @{}
+                    foreach ($metric in $metrics) {
+                        $metricName = [string]$metric.Name.Value
+                        $points = @($metric.Data)
+                        $totals = @($points | Where-Object { $null -ne $_.Total } | ForEach-Object { [double]$_.Total })
+                        $averages = @($points | Where-Object { $null -ne $_.Average } | ForEach-Object { [double]$_.Average })
+                        $maximums = @($points | Where-Object { $null -ne $_.Maximum } | ForEach-Object { [double]$_.Maximum })
+                        $metricValues[$metricName] = [PSCustomObject]@{
+                            Total = if ($totals.Count -gt 0) { [math]::Round(($totals | Measure-Object -Sum).Sum, 2) } else { $null }
+                            Average = if ($averages.Count -gt 0) { [math]::Round(($averages | Measure-Object -Average).Average, 2) } else { $null }
+                            Maximum = if ($maximums.Count -gt 0) { [math]::Round(($maximums | Measure-Object -Maximum).Maximum, 2) } else { $null }
+                        }
+                    }
+
+                    $requestMetricName = @('AzureOpenAIRequests','ModelRequests','TotalCalls') | Where-Object { $metricValues.ContainsKey($_) } | Select-Object -First 1
+                    $tokenMetricName = @('TokenTransaction','TotalTokens') | Where-Object { $metricValues.ContainsKey($_) } | Select-Object -First 1
+                    $utilizationMetricName = @('AzureOpenAIProvisionedManagedUtilizationV2','ProvisionedUtilization') | Where-Object { $metricValues.ContainsKey($_) } | Select-Object -First 1
+                    $availabilityMetricName = @('AzureOpenAIAvailabilityRate','ModelAvailabilityRate') | Where-Object { $metricValues.ContainsKey($_) } | Select-Object -First 1
+                    $requests = if ($requestMetricName) { $metricValues[$requestMetricName].Total } else { $null }
+                    $tokens = if ($tokenMetricName) { $metricValues[$tokenMetricName].Total } else { $null }
+
+                    $script:AIUsageData.Add([PSCustomObject]@{
+                        SubscriptionId = $SubId
+                        Subscription = $SubName
+                        ResourceId = [string]$resource.id
+                        ResourceName = [string]$resource.name
+                        Kind = $kind
+                        PeriodDays = $MetricDays
+                        Requests = $requests
+                        Tokens = $tokens
+                        Metrics = $metricValues
+                    })
+                    Add-Finding -Pillar "Performance Efficiency" -Severity "Info" -Category "AI - Usage Summary" `
+                        -ResourceName $resource.name -ResourceType $resourceType -ResourceGroup $resourceGroup -Subscription $SubName `
+                        -Description "$MetricDays-day utilization: requests=$(if ($null -ne $requests) { $requests } else { 'N/A' }), tokens=$(if ($null -ne $tokens) { $tokens } else { 'N/A' })." `
+                        -Recommendation "Use deployment-level dimensions in Azure Monitor for capacity planning and chargeback." `
+                        -Impact "Usage visibility supports model lifecycle, quota, performance, and cost decisions."
+
+                    if ($null -ne $requests -and $requests -eq 0) {
+                        Add-Finding -Pillar "Cost Optimization" -Severity "Low" -Category "AI - No Recent Usage" `
+                            -ResourceName $resource.name -ResourceType $resourceType -ResourceGroup $resourceGroup -Subscription $SubName `
+                            -Description "$kind resource recorded no model requests during the last $MetricDays days." `
+                            -Recommendation "Validate whether the resource is still required and remove unused deployments or the account after confirming dependencies." `
+                            -Impact "Unused AI resources and provisioned capacity can create avoidable cost and governance overhead."
+                    }
+                    if ($utilizationMetricName) {
+                        $utilization = $metricValues[$utilizationMetricName]
+                        if ($null -ne $utilization.Average -and $utilization.Average -lt 20) {
+                            Add-Finding -Pillar "Cost Optimization" -Severity "Medium" -Category "AI - Low Provisioned Utilization" `
+                                -ResourceName $resource.name -ResourceType $resourceType -ResourceGroup $resourceGroup -Subscription $SubName `
+                                -Description "Average provisioned model utilization was $($utilization.Average)% during the last $MetricDays days." `
+                                -Recommendation "Review PTU sizing, deployment schedules, and whether workloads can use pay-as-you-go or consolidated capacity." `
+                                -Impact "Low PTU utilization can result in significant committed-capacity waste."
+                        } elseif ($null -ne $utilization.Maximum -and $utilization.Maximum -ge 90) {
+                            Add-Finding -Pillar "Performance Efficiency" -Severity "Medium" -Category "AI - Provisioned Capacity Pressure" `
+                                -ResourceName $resource.name -ResourceType $resourceType -ResourceGroup $resourceGroup -Subscription $SubName `
+                                -Description "Provisioned model utilization reached $($utilization.Maximum)% during the last $MetricDays days." `
+                                -Recommendation "Review throttling, peak concurrency, spillover, and PTU capacity before demand increases." `
+                                -Impact "Sustained utilization near capacity can increase latency and HTTP 429 responses."
+                        }
+                    }
+                    if ($availabilityMetricName -and $null -ne $metricValues[$availabilityMetricName].Average -and $metricValues[$availabilityMetricName].Average -lt 99.9) {
+                        Add-Finding -Pillar "Reliability" -Severity "Medium" -Category "AI - Availability Below Target" `
+                            -ResourceName $resource.name -ResourceType $resourceType -ResourceGroup $resourceGroup -Subscription $SubName `
+                            -Description "Average model availability was $($metricValues[$availabilityMetricName].Average)% during the last $MetricDays days." `
+                            -Recommendation "Correlate server errors and throttling by deployment, configure alerts, and evaluate regional failover for critical workloads." `
+                            -Impact "Reduced model availability can interrupt user-facing and automated AI workloads."
+                    }
+                }
+            } catch {
+                Write-Status "  AI metrics unavailable for $($resource.name): $($_.Exception.Message)" "WARN"
+            }
+        }
+    }
+
+    Write-Status "  Azure AI analysis complete ($($aiResources.Count) resource(s), no additional inventory API calls)" "OK"
 }
 
 # ============================================================================
@@ -8446,7 +9317,15 @@ function Generate-HTMLReport {
     $riLowUtil = @($script:ReservationData | Where-Object { $_.UtilizationPct -ge 0 -and $_.UtilizationPct -lt 50 }).Count
     $riAvgUtil = 0
     $riWithUtil = @($script:ReservationData | Where-Object { $_.UtilizationPct -ge 0 })
-    if ($riWithUtil.Count -gt 0) { $riAvgUtil = [math]::Round(($riWithUtil | Measure-Object -Property UtilizationPct -Average).Average, 1) }
+    $riWithHours = @($script:ReservationData | Where-Object { $null -ne $_.ReservedHours -and $_.ReservedHours -gt 0 })
+    $riReservedHours = [math]::Round([double](($riWithHours | Measure-Object -Property ReservedHours -Sum).Sum), [int]2)
+    $riUsedHours = [math]::Round([double](($riWithHours | Measure-Object -Property UsedHours -Sum).Sum), [int]2)
+    $riUnusedHours = [math]::Round([double](($riWithHours | Measure-Object -Property UnusedHours -Sum).Sum), [int]2)
+    if ($riReservedHours -gt 0) {
+        $riAvgUtil = [math]::Round([double][math]::Min(100.0, ($riUsedHours / $riReservedHours) * 100.0), [int]1)
+    } elseif ($riWithUtil.Count -gt 0) {
+        $riAvgUtil = [math]::Round([double](($riWithUtil | Measure-Object -Property UtilizationPct -Average).Average), [int]1)
+    }
 
     $reservationRowsBuilder = [System.Text.StringBuilder]::new()
     foreach ($ri in ($script:ReservationData | Sort-Object @{Expression={ switch($_.Type) { 'Reservation'{0} 'SavingsPlan'{1} default{2} } }}, @{Expression={ if ($_.UtilizationPct -lt 0) { [double]::PositiveInfinity } else { $_.UtilizationPct } }})) {
@@ -8456,10 +9335,13 @@ function Generate-HTMLReport {
         $statusLabel = if ($ri.DaysToExpiry -lt 0 -and $ri.ExpiryDate) { 'Expired' } elseif ($ri.DaysToExpiry -ge 0 -and $ri.DaysToExpiry -le 30) { 'Expiring' } elseif ($ri.DaysToExpiry -ge 0 -and $ri.DaysToExpiry -le 90) { 'Exp. Soon' } else { 'Active' }
         $utilColor = if ($ri.UtilizationPct -lt 0) { '#605e5c' } elseif ($ri.UtilizationPct -lt 20) { '#d13438' } elseif ($ri.UtilizationPct -lt 50) { '#ca5010' } elseif ($ri.UtilizationPct -lt 80) { '#e8a838' } else { '#107c10' }
         $utilDisplay = if ($ri.UtilizationPct -lt 0) { 'N/A' } else { "$($ri.UtilizationPct)%" }
+        $utilizationWindow = if ($ri.UtilizationPct -lt 0) { 'No data' } else { "$($ri.UtilizationWindowDays)-day" }
+        $hoursDisplay = if ($null -ne $ri.ReservedHours) { "$($ri.UsedHours) / $($ri.ReservedHours) h" } else { 'N/A' }
+        $unusedDisplay = if ($null -ne $ri.UnusedHours) { "$($ri.UnusedHours) h unused" } else { 'Hour data unavailable' }
         $purchaseStr = if ($ri.PurchaseDate) { $ri.PurchaseDate.ToString('yyyy-MM-dd') } else { 'N/A' }
         $expiryStr = if ($ri.ExpiryDate) { $ri.ExpiryDate.ToString('yyyy-MM-dd') } else { 'N/A' }
         $daysStr = if ($ri.DaysToExpiry -ge 0) { "$($ri.DaysToExpiry)d" } elseif ($ri.ExpiryDate) { 'Expired' } else { 'N/A' }
-        [void]$reservationRowsBuilder.Append("<tr class=`"ri-row`" data-type=`"$(ConvertTo-SafeHtml $ri.Type)`" data-status=`"$(ConvertTo-SafeHtml $statusLabel)`"><td>$typeIcon $(ConvertTo-SafeHtml $typeLabel)</td><td><strong>$(ConvertTo-SafeHtml $ri.DisplayName)</strong><br><small style=`"color:#605e5c`">$(ConvertTo-SafeHtml $ri.ResourceType)</small></td><td><code style=`"background:#e1dfdd;padding:2px 6px;border-radius:4px;font-size:.85em`">$(ConvertTo-SafeHtml $ri.SKU)</code></td><td style=`"text-align:center`">$(ConvertTo-SafeHtml "$($ri.Quantity)")</td><td>$(ConvertTo-SafeHtml $ri.Term)</td><td>$(ConvertTo-SafeHtml $ri.Scope)</td><td style=`"text-align:center`"><span style=`"font-size:1.2em;font-weight:700;color:$utilColor`">$(ConvertTo-SafeHtml $utilDisplay)</span></td><td style=`"text-align:center;font-size:.85em`">$(ConvertTo-SafeHtml $purchaseStr)</td><td style=`"text-align:center`"><span class=`"severity-badge $statusClass`">$(ConvertTo-SafeHtml $statusLabel)</span><br><small style=`"color:#605e5c`">$(ConvertTo-SafeHtml "$expiryStr ($daysStr)")</small></td></tr>")
+        [void]$reservationRowsBuilder.Append("<tr class=`"ri-row`" data-type=`"$(ConvertTo-SafeHtml $ri.Type)`" data-status=`"$(ConvertTo-SafeHtml $statusLabel)`"><td>$typeIcon $(ConvertTo-SafeHtml $typeLabel)</td><td><strong>$(ConvertTo-SafeHtml $ri.DisplayName)</strong><br><small style=`"color:#605e5c`">$(ConvertTo-SafeHtml $ri.ResourceType)</small></td><td><code style=`"background:#e1dfdd;padding:2px 6px;border-radius:4px;font-size:.85em`">$(ConvertTo-SafeHtml $ri.SKU)</code></td><td style=`"text-align:center`">$(ConvertTo-SafeHtml "$($ri.Quantity)")</td><td>$(ConvertTo-SafeHtml $ri.Term)</td><td>$(ConvertTo-SafeHtml $ri.Scope)</td><td style=`"text-align:center`"><span style=`"font-size:1.2em;font-weight:700;color:$utilColor`">$(ConvertTo-SafeHtml $utilDisplay)</span><br><small>$(ConvertTo-SafeHtml $utilizationWindow)</small></td><td style=`"text-align:center`"><strong>$(ConvertTo-SafeHtml $hoursDisplay)</strong><br><small style=`"color:#605e5c`">$(ConvertTo-SafeHtml $unusedDisplay)</small></td><td style=`"text-align:center;font-size:.85em`">$(ConvertTo-SafeHtml $purchaseStr)</td><td style=`"text-align:center`"><span class=`"severity-badge $statusClass`">$(ConvertTo-SafeHtml $statusLabel)</span><br><small style=`"color:#605e5c`">$(ConvertTo-SafeHtml "$expiryStr ($daysStr)")</small></td></tr>")
     }
     $reservationRows = $reservationRowsBuilder.ToString()
 
@@ -8492,6 +9374,9 @@ function Generate-HTMLReport {
     }
     $commitmentRecommendationRows = $commitmentRecommendationRowsBuilder.ToString()
     $commitmentRecommendationCount = $displayCommitmentRecommendations.Count
+    $preferredAnnualSavings = [math]::Round([double](($displayCommitmentRecommendations | Where-Object { $_.DecisionStatus -eq 'Preferred' -and $null -ne $_.AnnualSavings } | Measure-Object -Property AnnualSavings -Sum).Sum), [int]2)
+    $preferredSavingsCurrencies = @($displayCommitmentRecommendations | Where-Object { $_.DecisionStatus -eq 'Preferred' -and $_.AnnualSavings -gt 0 } | Select-Object -ExpandProperty SavingsCurrency -Unique)
+    $preferredAnnualSavingsDisplay = if ($preferredAnnualSavings -gt 0 -and $preferredSavingsCurrencies.Count -eq 1) { "$($preferredAnnualSavings.ToString('N2', [System.Globalization.CultureInfo]::InvariantCulture)) $($preferredSavingsCurrencies[0])" } elseif ($preferredAnnualSavings -gt 0) { 'Multiple currencies' } else { 'N/A' }
 
     # Generate network topology — modern card layout
     $netVnets    = @($script:NetworkTopology | Where-Object { $_.Type -eq 'VNet' })
@@ -11411,6 +12296,10 @@ function Generate-HTMLReport {
                 <div style="font-size:.8em;color:var(--text-dim);font-weight:600;">Purchase Recommendations</div>
             </div>
             <div class="card" style="text-align:center;padding:16px;">
+                <div style="font-size:1.55em;font-weight:700;color:#107c10;">$(ConvertTo-SafeHtml $preferredAnnualSavingsDisplay)</div>
+                <div style="font-size:.8em;color:var(--text-dim);font-weight:600;">Preferred Annual Savings</div>
+            </div>
+            <div class="card" style="text-align:center;padding:16px;">
                 <div style="font-size:2em;font-weight:700;color:var(--accent-dark);">$riTotal</div>
                 <div style="font-size:.8em;color:var(--text-dim);font-weight:600;">Total Commitments</div>
             </div>
@@ -11433,6 +12322,10 @@ function Generate-HTMLReport {
             <div class="card" style="text-align:center;padding:16px;">
                 <div style="font-size:2em;font-weight:700;color:$(if($riLowUtil -gt 0){'#d13438'}else{'#107c10'});">$riLowUtil</div>
                 <div style="font-size:.8em;color:var(--text-dim);font-weight:600;">Low Util (&lt;50%)</div>
+            </div>
+            <div class="card" style="text-align:center;padding:16px;">
+                <div style="font-size:2em;font-weight:700;color:$(if($riUnusedHours -gt 0){'#ca5010'}else{'#107c10'});">$(if($riWithHours.Count -gt 0){$riUnusedHours}else{'N/A'})</div>
+                <div style="font-size:.8em;color:var(--text-dim);font-weight:600;">Unused Hours (30d)</div>
             </div>
         </div>
 
@@ -11475,6 +12368,7 @@ $(if ($riTotal -gt 0) { @"
                         <th style="width:8%">Term</th>
                         <th style="width:8%">Scope</th>
                         <th style="width:10%;text-align:center">Utilization</th>
+                        <th style="width:12%;text-align:center">Used / Reserved</th>
                         <th style="width:10%;text-align:center">Purchased</th>
                         <th style="width:12%;text-align:center">Status / Expiry</th>
                     </tr></thead>
@@ -12394,7 +13288,7 @@ $(if ($riTotal -gt 0) { @"
                     <tr><td><strong>11. Network Security (Advanced)</strong></td><td>Private endpoint coverage for PaaS services (12 resource types), DDoS protection (flagged only for VNets with public IP exposure), NSG flow logs.</td></tr>
                     <tr><td><strong>12. Modernization &amp; Hybrid</strong></td><td>Legacy resource identification, migration candidates, Arc-enabled server posture, and Cosmos DB / OSS database (PostgreSQL, MySQL, Redis) security review.</td></tr>
                     <tr><td><strong>13. ALZ/CAF Readiness</strong></td><td>Management Group hierarchy, MG-scope policy/RBAC per MG, ALZ policy library detection, hub-spoke/vWAN topology, Private DNS zone coverage and VNet links, Conditional Access policies, and PIM configuration. Graph-dependent items appear as manual checklist when Graph is unavailable.</td></tr>
-                    <tr><td><strong>14. Reservations &amp; Savings Plans</strong></td><td>Inventory of Azure Reserved Instances and Savings Plans. Analyzes utilization rates (7-day average), identifies underutilized commitments (&lt;50%), expiring reservations (≤90 days), and expired commitments. Flags subscriptions with significant compute but no reservations.</td></tr>
+                    <tr><td><strong>14. Reservations &amp; Savings Plans</strong></td><td>Inventory of Azure Reserved Instances and Savings Plans. Measures 30-day used, reserved, and unused hours with weighted utilization when Consumption data is available, falling back to the 7-day Capacity aggregate. Identifies underutilized commitments (&lt;50%), expiring reservations (≤90 days), and expired commitments.</td></tr>
                 </tbody>
             </table>
 
@@ -14790,6 +15684,7 @@ $exRiSectionHtml
 
 function Export-Data {
     Write-Status "Exporting data..." "SECTION"
+    Update-ResultSummary
 
     # Full JSON
     $exportData = @{
@@ -14799,9 +15694,22 @@ function Export-Data {
         Findings       = $script:Findings
         Resources      = $script:Resources
         NetworkTopology = $script:NetworkTopology
+        UnderutilizedResources = $script:UnderutilizedResources
+        AIServiceInventory = $script:AIServiceInventory
+        AIUsageData = $script:AIUsageData
+        AdoptionData = $script:AdoptionData
+        CostData = $script:CostData
+        StepResults = $script:StepResults
+        Errors = $script:ErrorLog
+        CommitmentRecommendations = $script:CommitmentRecommendations
+        ReservationData = $script:ReservationData
+        MarketplaceInventory = $script:MarketplaceInventory
+        MarketplaceCostData = $script:MarketplaceCostData
+        Checkpoints = @(Get-CheckpointSnapshots | Select-Object SubscriptionId, SubscriptionName, Status, StartedAt, CompletedAt, FailureReason)
     }
     $jsonPath = Join-Path $OutputPath "Assessment_Data.json"
-    $exportData | ConvertTo-Json -Depth 5 | Out-File -FilePath $jsonPath -Encoding UTF8
+    $exportData | ConvertTo-Json -Depth 15 | Out-File -FilePath $jsonPath -Encoding UTF8
+    Write-AtomicJsonFile -Data $exportData -Path (Join-Path $CheckpointPath 'consolidated.json') -Depth 15
     Write-Status "  JSON: $jsonPath" "OK"
 
     # Findings CSV
@@ -14810,12 +15718,457 @@ function Export-Data {
     Write-Status "  CSV: $csvPath" "OK"
 }
 
+function Write-AtomicJsonFile {
+    param(
+        [Parameter(Mandatory=$true)]$Data,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [int]$Depth = 12
+    )
+
+    $parent = Split-Path $Path -Parent
+    if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $temporaryPath = "$Path.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $Data | ConvertTo-Json -Depth $Depth | Set-Content -Path $temporaryPath -Encoding UTF8
+        Move-Item -Path $temporaryPath -Destination $Path -Force
+    } finally {
+        Remove-Item -Path $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-SubscriptionCheckpointFile {
+    param([Parameter(Mandatory=$true)][string]$SubId)
+    return Join-Path (Join-Path $CheckpointPath 'subscriptions') "$SubId.json"
+}
+
+function Update-ResultSummary {
+    $script:Summary.TotalResources = $script:Resources.Count
+    foreach ($severity in @('Critical','High','Medium','Low','Info')) {
+        $script:Summary[$severity] = 0
+    }
+    foreach ($finding in $script:Findings) {
+        if ($script:Summary.ContainsKey([string]$finding.Severity)) {
+            $script:Summary[[string]$finding.Severity]++
+        }
+    }
+}
+
+function Remove-SubscriptionResultState {
+    param([Parameter(Mandatory=$true)][string]$SubId, [Parameter(Mandatory=$true)][string]$SubName)
+
+    $script:Findings = [System.Collections.Generic.List[PSCustomObject]]@($script:Findings | Where-Object { if ($_.SubscriptionId) { $_.SubscriptionId -ne $SubId } else { $_.Subscription -ne $SubName } })
+    $script:Resources = [System.Collections.Generic.List[PSCustomObject]]@($script:Resources | Where-Object { if ($_.SubscriptionId) { $_.SubscriptionId -ne $SubId } else { $_.Subscription -ne $SubName } })
+    $script:NetworkTopology = [System.Collections.Generic.List[PSCustomObject]]@($script:NetworkTopology | Where-Object { if ($_.SubscriptionId) { $_.SubscriptionId -ne $SubId } else { $_.Subscription -ne $SubName } })
+    $script:UnderutilizedResources = [System.Collections.Generic.List[PSCustomObject]]@($script:UnderutilizedResources | Where-Object { if ($_.SubscriptionId) { $_.SubscriptionId -ne $SubId } else { $_.Subscription -ne $SubName } })
+    $script:AIServiceInventory = [System.Collections.Generic.List[PSCustomObject]]@($script:AIServiceInventory | Where-Object { $_.SubscriptionId -ne $SubId })
+    $script:AIUsageData = [System.Collections.Generic.List[PSCustomObject]]@($script:AIUsageData | Where-Object { $_.SubscriptionId -ne $SubId })
+    $script:StepResults = [System.Collections.Generic.List[PSCustomObject]]@($script:StepResults | Where-Object { if ($_.SubscriptionId) { $_.SubscriptionId -ne $SubId } else { $_.Subscription -ne $SubName } })
+    $script:ErrorLog = [System.Collections.Generic.List[PSCustomObject]]@($script:ErrorLog | Where-Object { if ($_.SubscriptionId) { $_.SubscriptionId -ne $SubId } else { $_.Subscription -ne $SubName } })
+    $script:CommitmentRecommendations = [System.Collections.Generic.List[PSCustomObject]]@($script:CommitmentRecommendations | Where-Object { $_.SubscriptionId -ne $SubId })
+    $script:ReservationData = [System.Collections.Generic.List[PSCustomObject]]@($script:ReservationData | Where-Object { if ($_.SubscriptionId) { $_.SubscriptionId -ne $SubId } else { $_.Subscription -ne $SubName } })
+    if ($script:MarketplaceInventory) {
+        $script:MarketplaceInventory = [System.Collections.Generic.List[PSCustomObject]]@($script:MarketplaceInventory | Where-Object { if ($_.SubscriptionId) { $_.SubscriptionId -ne $SubId } else { $_.Subscription -ne $SubName } })
+    }
+    $script:CostData.Remove($SubId)
+    if ($script:MarketplaceCostData) { $script:MarketplaceCostData.Remove($SubId) }
+    Update-ResultSummary
+}
+
+function Set-SubscriptionResultIdentity {
+    param([Parameter(Mandatory=$true)][string]$SubId, [Parameter(Mandatory=$true)][string]$SubName)
+
+    $collections = @(
+        $script:Findings, $script:Resources, $script:NetworkTopology, $script:UnderutilizedResources,
+        $script:StepResults, $script:ErrorLog, $script:ReservationData, $script:MarketplaceInventory,
+        $script:AIServiceInventory, $script:AIUsageData
+    )
+    foreach ($collection in $collections) {
+        foreach ($item in @($collection | Where-Object { $_.Subscription -eq $SubName -and -not $_.SubscriptionId })) {
+            $item | Add-Member -MemberType NoteProperty -Name SubscriptionId -Value $SubId -Force
+        }
+    }
+}
+
+function New-SubscriptionResultSnapshot {
+    param(
+        [Parameter(Mandatory=$true)]$Subscription,
+        [Parameter(Mandatory=$true)][ValidateSet('Completed','Failed','Running')][string]$Status,
+        [datetime]$StartedAt = (Get-Date),
+        [string]$FailureReason = ''
+    )
+
+    $subId = [string]$Subscription.Id
+    $subName = [string]$Subscription.Name
+    Set-SubscriptionResultIdentity -SubId $subId -SubName $subName
+    [ordered]@{
+        SchemaVersion              = 1
+        SubscriptionId            = $subId
+        SubscriptionName          = $subName
+        TenantId                  = [string]$Subscription.TenantId
+        Status                    = $Status
+        StartedAt                 = $StartedAt.ToUniversalTime().ToString('o')
+        CompletedAt               = if ($Status -eq 'Running') { $null } else { (Get-Date).ToUniversalTime().ToString('o') }
+        FailureReason             = $FailureReason
+        Findings                  = @($script:Findings | Where-Object { $_.SubscriptionId -eq $subId })
+        Resources                 = @($script:Resources | Where-Object { $_.SubscriptionId -eq $subId })
+        NetworkTopology           = @($script:NetworkTopology | Where-Object { $_.SubscriptionId -eq $subId })
+        UnderutilizedResources    = @($script:UnderutilizedResources | Where-Object { $_.SubscriptionId -eq $subId })
+        AIServiceInventory        = @($script:AIServiceInventory | Where-Object { $_.SubscriptionId -eq $subId })
+        AIUsageData               = @($script:AIUsageData | Where-Object { $_.SubscriptionId -eq $subId })
+        StepResults               = @($script:StepResults | Where-Object { $_.SubscriptionId -eq $subId })
+        Errors                    = @($script:ErrorLog | Where-Object { $_.SubscriptionId -eq $subId })
+        CostData                  = if ($script:CostData.ContainsKey($subId)) { $script:CostData[$subId] } else { $null }
+        CommitmentRecommendations = @($script:CommitmentRecommendations | Where-Object { $_.SubscriptionId -eq $subId })
+        ReservationData           = @($script:ReservationData | Where-Object { $_.SubscriptionId -eq $subId })
+        MarketplaceInventory      = @($script:MarketplaceInventory | Where-Object { $_.SubscriptionId -eq $subId })
+        MarketplaceCostData       = if ($script:MarketplaceCostData -and $script:MarketplaceCostData.ContainsKey($subId)) { $script:MarketplaceCostData[$subId] } else { $null }
+    }
+}
+
+function Save-SubscriptionCheckpoint {
+    param(
+        [Parameter(Mandatory=$true)]$Subscription,
+        [Parameter(Mandatory=$true)][ValidateSet('Completed','Failed','Running')][string]$Status,
+        [datetime]$StartedAt = (Get-Date),
+        [string]$FailureReason = ''
+    )
+
+    $snapshot = New-SubscriptionResultSnapshot -Subscription $Subscription -Status $Status -StartedAt $StartedAt -FailureReason $FailureReason
+    Write-AtomicJsonFile -Data $snapshot -Path (Get-SubscriptionCheckpointFile -SubId $Subscription.Id) -Depth 15
+    return $snapshot
+}
+
+function Import-SubscriptionCheckpoint {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $snapshot = Get-Content -Path $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $snapshot.SubscriptionId -or -not $snapshot.SubscriptionName) { throw "Invalid checkpoint: $Path" }
+    Remove-SubscriptionResultState -SubId $snapshot.SubscriptionId -SubName $snapshot.SubscriptionName
+
+    foreach ($item in @($snapshot.Findings)) { $script:Findings.Add($item) }
+    foreach ($item in @($snapshot.Resources)) { $script:Resources.Add($item) }
+    foreach ($item in @($snapshot.NetworkTopology)) { $script:NetworkTopology.Add($item) }
+    foreach ($item in @($snapshot.UnderutilizedResources)) { $script:UnderutilizedResources.Add($item) }
+    foreach ($item in @($snapshot.AIServiceInventory)) { $script:AIServiceInventory.Add($item) }
+    foreach ($item in @($snapshot.AIUsageData)) { $script:AIUsageData.Add($item) }
+    foreach ($item in @($snapshot.StepResults)) { $script:StepResults.Add($item) }
+    foreach ($item in @($snapshot.Errors)) { $script:ErrorLog.Add($item) }
+    foreach ($item in @($snapshot.CommitmentRecommendations)) { $script:CommitmentRecommendations.Add($item) }
+    foreach ($item in @($snapshot.ReservationData)) {
+        $exists = $script:ReservationData | Where-Object { $_.BenefitId -and $_.BenefitId -eq $item.BenefitId } | Select-Object -First 1
+        if (-not $exists) { $script:ReservationData.Add($item) }
+    }
+    foreach ($item in @($snapshot.MarketplaceInventory)) {
+        if (-not $script:MarketplaceInventory) { $script:MarketplaceInventory = [System.Collections.Generic.List[PSCustomObject]]::new() }
+        $script:MarketplaceInventory.Add($item)
+    }
+    if ($null -ne $snapshot.CostData) { $script:CostData[$snapshot.SubscriptionId] = $snapshot.CostData }
+    if ($null -ne $snapshot.MarketplaceCostData) {
+        if (-not $script:MarketplaceCostData) { $script:MarketplaceCostData = @{} }
+        $script:MarketplaceCostData[$snapshot.SubscriptionId] = $snapshot.MarketplaceCostData
+    }
+    Set-SubscriptionResultIdentity -SubId $snapshot.SubscriptionId -SubName $snapshot.SubscriptionName
+    Update-ResultSummary
+    return $snapshot
+}
+
+function Get-CheckpointSnapshots {
+    $subscriptionPath = Join-Path $CheckpointPath 'subscriptions'
+    if (-not (Test-Path $subscriptionPath)) { return @() }
+    return @(Get-ChildItem -Path $subscriptionPath -Filter '*.json' -File | ForEach-Object {
+        try { Get-Content -Path $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }
+    } | Where-Object { $_ })
+}
+
+function Write-CheckpointManifest {
+    $snapshots = @(Get-CheckpointSnapshots)
+    $snapshotBySubscriptionId = @{}
+    foreach ($snapshot in $snapshots) {
+        if ($snapshot.SubscriptionId) { $snapshotBySubscriptionId[[string]$snapshot.SubscriptionId] = $snapshot }
+    }
+    $manifest = [ordered]@{
+        SchemaVersion = 1
+        UpdatedAt = (Get-Date).ToUniversalTime().ToString('o')
+        TenantId = if ($script:Subscriptions.Count -gt 0) { [string]$script:Subscriptions[0].TenantId } else { '' }
+        Subscriptions = @($script:Subscriptions | ForEach-Object {
+            $sub = $_
+            $snapshot = $snapshotBySubscriptionId[[string]$sub.Id]
+            [ordered]@{
+                Id = $sub.Id; Name = $sub.Name
+                Status = if ($snapshot) { $snapshot.Status } else { 'Pending' }
+                CompletedAt = if ($snapshot) { $snapshot.CompletedAt } else { $null }
+                FailureReason = if ($snapshot) { $snapshot.FailureReason } else { '' }
+            }
+        })
+    }
+    Write-AtomicJsonFile -Data $manifest -Path (Join-Path $CheckpointPath 'manifest.json') -Depth 8
+    return $manifest
+}
+
+function Save-TenantCheckpoint {
+    $tenantState = [ordered]@{
+        SchemaVersion = 1
+        UpdatedAt = (Get-Date).ToUniversalTime().ToString('o')
+        Findings = @($script:Findings | Where-Object { $_.Subscription -eq 'Tenant-wide' })
+        StepResults = @($script:StepResults | Where-Object { $_.Subscription -eq 'Tenant-wide' })
+        Errors = @($script:ErrorLog | Where-Object { $_.Subscription -eq 'Tenant-wide' })
+        ReservationData = @($script:ReservationData | Where-Object { $_.Subscription -eq 'Tenant-wide' })
+        ALZData = $script:ALZData
+        AdoptionData = $script:AdoptionData
+    }
+    Write-AtomicJsonFile -Data $tenantState -Path (Join-Path $CheckpointPath 'tenant-wide.json') -Depth 15
+}
+
+function Import-TenantCheckpoint {
+    $path = Join-Path $CheckpointPath 'tenant-wide.json'
+    if (-not (Test-Path $path)) { return $false }
+    $tenantState = Get-Content -Path $path -Raw -Encoding UTF8 | ConvertFrom-Json
+    $script:Findings = [System.Collections.Generic.List[PSCustomObject]]@($script:Findings | Where-Object { $_.Subscription -ne 'Tenant-wide' })
+    $script:StepResults = [System.Collections.Generic.List[PSCustomObject]]@($script:StepResults | Where-Object { $_.Subscription -ne 'Tenant-wide' })
+    $script:ErrorLog = [System.Collections.Generic.List[PSCustomObject]]@($script:ErrorLog | Where-Object { $_.Subscription -ne 'Tenant-wide' })
+    $script:ReservationData = [System.Collections.Generic.List[PSCustomObject]]@($script:ReservationData | Where-Object { $_.Subscription -ne 'Tenant-wide' })
+    foreach ($item in @($tenantState.Findings)) { $script:Findings.Add($item) }
+    foreach ($item in @($tenantState.StepResults)) { $script:StepResults.Add($item) }
+    foreach ($item in @($tenantState.Errors)) { $script:ErrorLog.Add($item) }
+    foreach ($item in @($tenantState.ReservationData)) { $script:ReservationData.Add($item) }
+    if ($tenantState.PSObject.Properties['ReservationData']) { $script:ReservationInventoryLoaded = $true }
+    if ($tenantState.ALZData) { $script:ALZData = $tenantState.ALZData }
+    if ($tenantState.AdoptionData) { $script:AdoptionData = $tenantState.AdoptionData }
+    Update-ResultSummary
+    return $true
+}
+
+function Write-PartialAssessmentReport {
+    param([switch]$Force)
+
+    $now = Get-Date
+    if (-not $Force -and ($now - $script:LastPartialReportAt).TotalSeconds -lt $ProgressIntervalSeconds) { return }
+
+    $manifest = Write-CheckpointManifest
+    Update-ResultSummary
+    $partialData = [ordered]@{
+        GeneratedAt = (Get-Date).ToUniversalTime().ToString('o')
+        IsPartial = @($manifest.Subscriptions | Where-Object { $_.Status -ne 'Completed' }).Count -gt 0
+        Subscriptions = $manifest.Subscriptions
+        Summary = $script:Summary
+        AdoptionData = $script:AdoptionData
+        DetailedResults = [ordered]@{
+            Format = 'Per-subscription checkpoints'
+            Directory = (Join-Path $CheckpointPath 'subscriptions')
+            ConsolidatedFile = (Join-Path $CheckpointPath 'consolidated.json')
+            AvailableAfterCompletion = $false
+        }
+    }
+    Write-AtomicJsonFile -Data $partialData -Path (Join-Path $OutputPath 'Assessment_Partial.json') -Depth 8
+    $script:Findings | Export-Csv -Path (Join-Path $OutputPath 'Findings_Partial.csv') -NoTypeInformation -Encoding UTF8 -Force
+
+    $rows = @($manifest.Subscriptions | ForEach-Object {
+        $status = ConvertTo-SafeHtml ([string]$_.Status)
+        "<tr><td>$(ConvertTo-SafeHtml ([string]$_.Name))</td><td>$(ConvertTo-SafeHtml ([string]$_.Id))</td><td>$status</td><td>$(ConvertTo-SafeHtml ([string]$_.FailureReason))</td></tr>"
+    }) -join [Environment]::NewLine
+    $html = @"
+<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="30"><title>Azure Assessment Progress</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:32px;color:#242424}table{border-collapse:collapse;width:100%}th,td{padding:8px;border:1px solid #ddd;text-align:left}th{background:#0078d4;color:#fff}.summary{margin:16px 0;font-weight:600}</style></head><body><h1>Azure Assessment Progress</h1><div class="summary">Completed: $(@($manifest.Subscriptions | Where-Object Status -eq 'Completed').Count) / $($manifest.Subscriptions.Count) | Findings: $($script:Findings.Count) | Resources: $($script:Resources.Count)</div><table><thead><tr><th>Subscription</th><th>ID</th><th>Status</th><th>Failure</th></tr></thead><tbody>$rows</tbody></table></body></html>
+"@
+    $html | Set-Content -Path (Join-Path $OutputPath 'Assessment_Partial.html') -Encoding UTF8
+    $script:LastPartialReportAt = $now
+}
+
+function Get-SubscriptionExecutionPlan {
+    $snapshotById = @{}
+    foreach ($snapshot in @(Get-CheckpointSnapshots)) { $snapshotById[[string]$snapshot.SubscriptionId] = $snapshot }
+
+    if ($Resume -or $RetryFailedOnly) {
+        if (-not (Test-Path $CheckpointPath)) { throw "Checkpoint path not found: $CheckpointPath" }
+        Import-TenantCheckpoint | Out-Null
+        foreach ($sub in $script:Subscriptions) {
+            $snapshot = $snapshotById[[string]$sub.Id]
+            if ($snapshot -and $snapshot.Status -eq 'Completed') {
+                Import-SubscriptionCheckpoint -Path (Get-SubscriptionCheckpointFile -SubId $sub.Id) | Out-Null
+            }
+        }
+    }
+
+    if ($RetryFailedOnly) {
+        return @($script:Subscriptions | Where-Object {
+            $snapshot = $snapshotById[[string]$_.Id]
+            $snapshot -and $snapshot.Status -eq 'Failed'
+        })
+    }
+    if ($Resume) {
+        return @($script:Subscriptions | Where-Object {
+            $snapshot = $snapshotById[[string]$_.Id]
+            -not $snapshot -or $snapshot.Status -ne 'Completed'
+        })
+    }
+    return @($script:Subscriptions)
+}
+
+function Initialize-CheckpointStore {
+    if ($Resume -or $RetryFailedOnly -or $WorkerMode) { return }
+    foreach ($knownPath in @('subscriptions','workers','manifest.json','consolidated.json','tenant-wide.json')) {
+        $target = Join-Path $CheckpointPath $knownPath
+        if (Test-Path $target) { Remove-Item -Path $target -Recurse -Force -ErrorAction Stop }
+    }
+}
+
+function Split-SubscriptionBatches {
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Subscriptions, [Parameter(Mandatory=$true)][int]$Size)
+    $batches = [System.Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $Subscriptions.Count; $index += $Size) {
+        $lastIndex = [math]::Min($index + $Size - 1, $Subscriptions.Count - 1)
+        $batches.Add(@($Subscriptions[$index..$lastIndex]))
+    }
+    return $batches
+}
+
+function Get-WorkerArgumentList {
+    param(
+        [Parameter(Mandatory=$true)][string]$ConfigPath,
+        [Parameter(Mandatory=$true)][string]$ScriptPath
+    )
+    return @('-NoLogo', '-NoProfile', '-File', "`"$ScriptPath`"", '-WorkerConfigPath', "`"$ConfigPath`"")
+}
+
+function New-WorkerConfiguration {
+    param(
+        [Parameter(Mandatory=$true)]$Subscription,
+        [Parameter(Mandatory=$true)][string]$WorkerOutputPath,
+        [Parameter(Mandatory=$true)][string]$ContextPath
+    )
+    return [ordered]@{
+        SubscriptionId = @([string]$Subscription.Id); OutputPath = $WorkerOutputPath; CheckpointPath = $CheckpointPath
+        WorkerContextPath = $ContextPath; WorkerMode = $true; SkipLogin = $true; BatchSize = 1; MaxParallelism = 1
+        ProgressIntervalSeconds = $ProgressIntervalSeconds; TenantId = [string]$Subscription.TenantId
+        UseDeviceAuthentication = $false; SkipGraphLogin = $true
+        MetricDays = $MetricDays; CommitmentLookbackDays = $CommitmentLookbackDays; IncludeAIMetrics = [bool]$IncludeAIMetrics
+        CpuLowPercent = $CpuLowPercent; CpuIdlePercent = $CpuIdlePercent; NetLowMB = $NetLowMB
+        AppRequestLowPerHour = $AppRequestLowPerHour; SqlDtuLowPercent = $SqlDtuLowPercent
+        SqlCpuLowPercent = $SqlCpuLowPercent; DiskLowIops = $DiskLowIops; MandatoryTags = @($MandatoryTags)
+        SkipMetrics = [bool]$SkipMetrics; SkipKeyVaultDataPlane = [bool]$SkipKeyVaultDataPlane
+        SkipBackupDetails = [bool]$SkipBackupDetails; IncludeALZ = [bool]$IncludeALZ
+        RequireValidSignature = [bool]$RequireValidSignature
+    }
+}
+
+function Invoke-ParallelSubscriptionWorkers {
+    param([Parameter(Mandatory=$true)][array]$Subscriptions)
+
+    $workerRoot = Join-Path $CheckpointPath 'workers'
+    if (-not (Test-Path $workerRoot)) { New-Item -ItemType Directory -Path $workerRoot -Force | Out-Null }
+    $workerContextFile = Join-Path ([System.IO.Path]::GetTempPath()) "azure-assessment-context-$([guid]::NewGuid().ToString('N')).json"
+    Save-AzContext -Path $workerContextFile -Force -ErrorAction Stop | Out-Null
+        try {
+            $pending = [System.Collections.Generic.Queue[object]]::new()
+            foreach ($subscription in $Subscriptions) { $pending.Enqueue($subscription) }
+            $active = [System.Collections.Generic.List[object]]::new()
+            $completed = 0
+
+            while ($pending.Count -gt 0 -or $active.Count -gt 0) {
+        while ($pending.Count -gt 0 -and $active.Count -lt $MaxParallelism) {
+            $subscription = $pending.Dequeue()
+            $workerOutput = Join-Path $workerRoot $subscription.Id
+            if (-not (Test-Path $workerOutput)) { New-Item -ItemType Directory -Path $workerOutput -Force | Out-Null }
+            $stdoutPath = Join-Path $workerOutput 'worker.stdout.log'
+            $stderrPath = Join-Path $workerOutput 'worker.stderr.log'
+            $configPath = Join-Path $workerOutput 'worker.config.json'
+            Write-AtomicJsonFile -Data (New-WorkerConfiguration -Subscription $subscription -WorkerOutputPath $workerOutput -ContextPath $workerContextFile) -Path $configPath -Depth 5
+            $process = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList (Get-WorkerArgumentList -ConfigPath $configPath -ScriptPath $PSCommandPath) -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+            $active.Add([PSCustomObject]@{ Process = $process; Subscription = $subscription; StartedAt = Get-Date; StdErr = $stderrPath })
+            Write-Status "  Worker started: $($subscription.Name) (PID $($process.Id))" "INFO"
+        }
+
+        $now = Get-Date
+        $expired = @($active | Where-Object { -not $_.Process.HasExited -and ($now - $_.StartedAt).TotalMinutes -ge $WorkerTimeoutMinutes })
+        foreach ($worker in $expired) {
+            try { Stop-Process -Id $worker.Process.Id -Force -ErrorAction SilentlyContinue } catch { }
+            try { $worker.Process.WaitForExit(5000) | Out-Null } catch { }
+            $active.Remove($worker)
+            $completed++
+            $failure = "Worker exceeded the $WorkerTimeoutMinutes minute runtime limit and was terminated"
+            Save-SubscriptionCheckpoint -Subscription $worker.Subscription -Status Failed -StartedAt $worker.StartedAt -FailureReason $failure | Out-Null
+            Write-Status "  $($worker.Subscription.Name): $failure" "WARN"
+            Write-PartialAssessmentReport
+            Complete-ExecutionProgressUnit
+        }
+
+        $finished = @($active | Where-Object { $_.Process.HasExited })
+        if ($finished.Count -eq 0 -and $active.Count -gt 0) {
+            Start-Sleep -Seconds 2
+            continue
+        }
+        foreach ($worker in $finished) {
+            $active.Remove($worker)
+            $completed++
+            $checkpointFile = Get-SubscriptionCheckpointFile -SubId $worker.Subscription.Id
+            if (Test-Path $checkpointFile) {
+                $snapshot = Import-SubscriptionCheckpoint -Path $checkpointFile
+                Write-Status "  Worker completed [$completed/$($Subscriptions.Count)]: $($worker.Subscription.Name) ($($snapshot.Status))" $(if ($snapshot.Status -eq 'Completed') { 'OK' } else { 'WARN' })
+            } else {
+                $failure = "Worker exited with code $($worker.Process.ExitCode) without a checkpoint"
+                if (Test-Path $worker.StdErr) {
+                    $stderrText = (Get-Content $worker.StdErr -Raw -ErrorAction SilentlyContinue).Trim()
+                    if ($stderrText) { $failure = "$failure. $stderrText" }
+                }
+                Save-SubscriptionCheckpoint -Subscription $worker.Subscription -Status Failed -StartedAt $worker.StartedAt -FailureReason $failure | Out-Null
+                Write-Status "  $($worker.Subscription.Name): $failure" "WARN"
+            }
+            Write-PartialAssessmentReport
+            Complete-ExecutionProgressUnit
+        }
+      }
+    } finally {
+        Remove-Item -Path $workerContextFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ============================================================================
 # MAIN - ORCHESTRATION
 # ============================================================================
 function Main {
+    $isCloudShell = $env:AZUREPS_HOST_ENVIRONMENT -like 'cloud-shell*' -or $env:ACC_TERM_ID
+    $cloudDrivePath = if ($HOME) { Join-Path $HOME 'clouddrive' } else { $null }
+    if (-not $WorkerMode -and $isCloudShell -and -not $script:OutputPathExplicitlySpecified -and $cloudDrivePath -and (Test-Path $cloudDrivePath)) {
+        $script:OutputPath = Join-Path $cloudDrivePath "AzureAssessment_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        Write-Host "Cloud Shell persistent output: $script:OutputPath" -ForegroundColor Cyan
+    }
+    if ([string]::IsNullOrWhiteSpace($CheckpointPath)) {
+        $script:CheckpointPath = Join-Path $OutputPath '.checkpoint'
+    }
+    Initialize-CheckpointStore
+    if ($WorkerMode -and $WorkerContextPath) {
+        Import-AzContext -Path $WorkerContextPath -ErrorAction Stop | Out-Null
+    }
     Initialize-Assessment
     Start-KeepAlive   # Prevent Cloud Shell idle timeout
+
+    if ($MaxParallelism -gt 1 -and -not $WorkerMode) {
+        $executionSubscriptions = @(Get-SubscriptionExecutionPlan)
+        Initialize-ExecutionProgress -Total $executionSubscriptions.Count
+        if (-not (($Resume -or $RetryFailedOnly) -and (Import-TenantCheckpoint))) {
+            Invoke-AnalysisStep "ALZReadiness" "" "Tenant-wide" { Analyze-ALZReadiness }
+        }
+        if (-not $script:ReservationInventoryLoaded) {
+            Invoke-AnalysisStep "ReservationInventory" "" "Tenant-wide" { Analyze-Reservations -SubName 'Tenant-wide' -TenantInventoryOnly }
+        }
+        Save-TenantCheckpoint
+        Write-Status "Starting isolated subscription workers (max parallelism: $MaxParallelism)" "SECTION"
+        $parallelBatches = @(Split-SubscriptionBatches -Subscriptions $executionSubscriptions -Size $BatchSize)
+        $parallelBatchIndex = 0
+        foreach ($parallelBatch in $parallelBatches) {
+            $parallelBatchIndex++
+            Write-Status "Starting parallel batch $parallelBatchIndex/$($parallelBatches.Count) ($($parallelBatch.Count) subscriptions)" "SECTION"
+            Invoke-ParallelSubscriptionWorkers -Subscriptions $parallelBatch
+        }
+        Write-PartialAssessmentReport -Force
+        Invoke-OptionalAdoptionAnalysis
+        Update-ResultSummary
+        Invoke-AnalysisStep "Generate-HTMLReport" "" "Reports" { Generate-HTMLReport }
+        Invoke-AnalysisStep "Generate-ArchitectureDiagram" "" "Reports" { Generate-ArchitectureDiagram }
+        Invoke-AnalysisStep "Generate-ExecutiveReport" "" "Reports" { Generate-ExecutiveReport }
+        Invoke-AnalysisStep "Export-Data" "" "Reports" { Export-Data }
+        Stop-KeepAlive
+        return
+    }
 
     # ── Pre-fetch security data via Resource Graph (bulk, in batches of 10 subs) ──
     $script:CachedSecurityAssessments = @{}   # Key = subscriptionId
@@ -14940,15 +16293,17 @@ function Main {
 
         # ── Pre-cache Role Assignments (summarized count per sub — full list too large for big tenants) ──
         $script:CachedRoleAssignments = @{}
+        $script:CachedRoleAssignmentsAvailable = $false
         Write-Status "Pre-fetching role assignments via Resource Graph..." "INFO"
         try {
-            $allRoles = Invoke-GraphBulkQuery -QueryText "authorizationresources | where type =~ 'microsoft.authorization/roleassignments' | project subscriptionId, id, roleId=tostring(properties.roleDefinitionId), principalType=tostring(properties.principalType), scope=tostring(properties.scope)" -SubscriptionIds $allSubIds -BatchSize $SubBatchSize
+            $allRoles = Invoke-GraphBulkQuery -QueryText "authorizationresources | where type =~ 'microsoft.authorization/roleassignments' | extend roleId=tolower(tostring(properties.roleDefinitionId)), principalType=tostring(properties.principalType) | where (principalType =~ 'User' and (roleId endswith '8e3af657-a8ff-443c-a75c-2fe8c4bcb635' or roleId endswith 'b24988ac-6180-42a0-ab88-20f7382dd24c')) or isempty(principalType) or principalType =~ 'Unknown' | project subscriptionId, roleId, principalType" -SubscriptionIds $allSubIds -BatchSize $SubBatchSize
             foreach ($r in $allRoles) {
                 $sid = $r.subscriptionId
                 if (-not $script:CachedRoleAssignments.ContainsKey($sid)) { $script:CachedRoleAssignments[$sid] = [System.Collections.Generic.List[PSObject]]::new() }
                 $script:CachedRoleAssignments[$sid].Add($r)
             }
-            Write-Status "  Role assignments cached: $($allRoles.Count) across $($script:CachedRoleAssignments.Keys.Count) subs" "OK"
+            $script:CachedRoleAssignmentsAvailable = $true
+            Write-Status "  Relevant role assignments cached: $($allRoles.Count) across $($script:CachedRoleAssignments.Keys.Count) subs" "OK"
         } catch {
             Write-Status "  Role assignments pre-fetch failed (will fall back to per-sub): $($_.Exception.Message)" "WARN"
         }
@@ -14985,6 +16340,7 @@ function Main {
 
         # ── Pre-cache Auto-shutdown schedules ──
         $script:CachedAutoShutdown = @{}
+        $script:CachedAutoShutdownAvailable = $false
         Write-Status "Pre-fetching auto-shutdown schedules via Resource Graph..." "INFO"
         try {
             $allShutdown = Invoke-GraphBulkQuery -QueryText "resources | where type =~ 'microsoft.devtestlab/schedules' | where name startswith 'shutdown-computevm-' | project subscriptionId, id, name, properties" -SubscriptionIds $allSubIds -BatchSize $SubBatchSize
@@ -14993,6 +16349,7 @@ function Main {
                 if (-not $script:CachedAutoShutdown.ContainsKey($sid)) { $script:CachedAutoShutdown[$sid] = [System.Collections.Generic.List[PSObject]]::new() }
                 $script:CachedAutoShutdown[$sid].Add($s)
             }
+            $script:CachedAutoShutdownAvailable = $true
             Write-Status "  Auto-shutdown cached: $($allShutdown.Count) schedules across $($script:CachedAutoShutdown.Keys.Count) subs" "OK"
         } catch {
             Write-Status "  Auto-shutdown pre-fetch failed (will fall back to per-sub): $($_.Exception.Message)" "WARN"
@@ -15061,18 +16418,45 @@ function Main {
     }
 
     # ── ALZ/CAF Readiness (tenant-wide, runs once before per-subscription loop) ──
-    Invoke-AnalysisStep "ALZReadiness" "" "Tenant-wide" { Analyze-ALZReadiness }
+    if (-not $WorkerMode) {
+        if (-not (($Resume -or $RetryFailedOnly) -and (Import-TenantCheckpoint))) {
+            Invoke-AnalysisStep "ALZReadiness" "" "Tenant-wide" { Analyze-ALZReadiness }
+        }
+        if (-not $script:ReservationInventoryLoaded) {
+            Invoke-AnalysisStep "ReservationInventory" "" "Tenant-wide" { Analyze-Reservations -SubName 'Tenant-wide' -TenantInventoryOnly }
+        }
+        Save-TenantCheckpoint
+    }
+
+    $executionSubscriptions = @(Get-SubscriptionExecutionPlan)
+    Initialize-ExecutionProgress -Total $executionSubscriptions.Count
+    $subscriptionBatches = @(Split-SubscriptionBatches -Subscriptions $executionSubscriptions -Size $BatchSize)
+    if (($Resume -or $RetryFailedOnly) -and $executionSubscriptions.Count -lt $script:Subscriptions.Count) {
+        Write-Status "Restored $($script:Subscriptions.Count - $executionSubscriptions.Count) completed subscription checkpoint(s)" "OK"
+    }
+    if ($RetryFailedOnly) {
+        Write-Status "Retrying only failed subscriptions: $($executionSubscriptions.Count)" "INFO"
+    }
 
     $subIndex = 0
     $subTotal = $script:Subscriptions.Count
+    $executionTotal = $executionSubscriptions.Count
     $consecutiveNetworkFailures = 0
+    $abortRemainingSubscriptions = $false
     $skippedSubscriptions = [System.Collections.Generic.List[string]]::new()
-    foreach ($sub in $script:Subscriptions) {
+    $batchIndex = 0
+    foreach ($batch in $subscriptionBatches) {
+      $batchIndex++
+      Write-Status "Processing subscription batch $batchIndex/$($subscriptionBatches.Count) ($($batch.Count) subscriptions)" "SECTION"
+      foreach ($sub in $batch) {
         $subIndex++
+        $subscriptionStartedAt = Get-Date
+        Remove-SubscriptionResultState -SubId $sub.Id -SubName $sub.Name
+        Save-SubscriptionCheckpoint -Subscription $sub -Status Running -StartedAt $subscriptionStartedAt | Out-Null
         $elapsed = [math]::Round(((Get-Date) - $script:StartTime).TotalMinutes, 1)
         Write-Host ""
         Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
-        Write-Status "[$subIndex/$subTotal] ANALYZING SUBSCRIPTION: $($sub.Name)  ($elapsed min elapsed)" "SECTION"
+        Write-Status "[$subIndex/$executionTotal] ANALYZING SUBSCRIPTION: $($sub.Name)  ($elapsed min elapsed)" "SECTION"
         Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
 
         # Switch subscription context with retry logic for transient network failures
@@ -15108,7 +16492,7 @@ function Main {
                     Write-Status "The report will be generated with data collected so far ($($subIndex - $consecutiveNetworkFailures)/$subTotal subscriptions)." "WARN"
                     Write-Status "To complete the assessment: restart Cloud Shell and re-run the script." "INFO"
                     Write-Host ""
-                    break
+                    $abortRemainingSubscriptions = $true
                 }
             } else {
                 # Access/permission error — skip this subscription but don't count as network failure
@@ -15116,6 +16500,10 @@ function Main {
                 Write-Status "  Skipping subscription $($sub.Name) (access denied or invalid)." "WARN"
                 $consecutiveNetworkFailures = 0
             }
+            Save-SubscriptionCheckpoint -Subscription $sub -Status Failed -StartedAt $subscriptionStartedAt -FailureReason $errMsg | Out-Null
+            if (-not $WorkerMode) { Write-PartialAssessmentReport }
+            Complete-ExecutionProgressUnit
+            if ($abortRemainingSubscriptions) { break }
             continue
         }
 
@@ -15128,6 +16516,9 @@ function Main {
         # Skip all analysis if data collection failed (prevents stale cache from previous sub)
         if (-not $script:DataCollectionSucceeded) {
             Write-Status "Skipping analysis for $($sub.Name) — data collection failed" "WARN"
+            Save-SubscriptionCheckpoint -Subscription $sub -Status Failed -StartedAt $subscriptionStartedAt -FailureReason 'Data collection failed' | Out-Null
+            if (-not $WorkerMode) { Write-PartialAssessmentReport }
+            Complete-ExecutionProgressUnit
             continue
         }
 
@@ -15135,39 +16526,55 @@ function Main {
         Invoke-AnalysisStep "CostAnalysis"            $sub.Id $sub.Name { Get-SubscriptionCostAnalysis -SubId $sub.Id -SubName $sub.Name }
 
         Invoke-AnalysisStep "ResourceInventory"       $sub.Id $sub.Name { Get-ResourceInventory -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "Networking"               $sub.Id $sub.Name { Analyze-Networking    -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "VirtualMachines"          $sub.Id $sub.Name { Analyze-VirtualMachines -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "AppServices"              $sub.Id $sub.Name { Analyze-AppServices   -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "Databases"                $sub.Id $sub.Name { Analyze-Databases     -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "Storage"                  $sub.Id $sub.Name { Analyze-Storage       -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "KeyVaults"                $sub.Id $sub.Name { Analyze-KeyVaults     -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "OrphanedResources"        $sub.Id $sub.Name { Analyze-OrphanedResources -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "Networking" $sub.Id $sub.Name @('microsoft.network/virtualnetworks','microsoft.network/networksecuritygroups','microsoft.network/publicipaddresses','microsoft.network/applicationgateways','microsoft.network/loadbalancers','microsoft.network/natgateways','microsoft.network/virtualnetworkgateways') { Analyze-Networking -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "VirtualMachines" $sub.Id $sub.Name 'microsoft.compute/virtualmachines' { Analyze-VirtualMachines -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "AppServices" $sub.Id $sub.Name 'microsoft.web/sites' { Analyze-AppServices -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "Databases" $sub.Id $sub.Name @('microsoft.sql/servers','microsoft.dbforpostgresql/flexibleservers','microsoft.dbformysql/flexibleservers','microsoft.documentdb/databaseaccounts','microsoft.cache/redis') { Analyze-Databases -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "Storage" $sub.Id $sub.Name 'microsoft.storage/storageaccounts' { Analyze-Storage -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "KeyVaults" $sub.Id $sub.Name 'microsoft.keyvault/vaults' { Analyze-KeyVaults -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "OrphanedResources" $sub.Id $sub.Name @('microsoft.compute/disks','microsoft.network/networkinterfaces','microsoft.network/publicipaddresses') { Analyze-OrphanedResources -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "SecurityCenter"           $sub.Id $sub.Name { Analyze-SecurityCenter -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "AKS"                      $sub.Id $sub.Name { Analyze-AKS               -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "AKS" $sub.Id $sub.Name 'microsoft.containerservice/managedclusters' { Analyze-AKS -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "ZeroTrust"                $sub.Id $sub.Name { Analyze-ZeroTrust         -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "UnderutilizedResources"   $sub.Id $sub.Name { Analyze-UnderutilizedResources -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "UnderutilizedResources" $sub.Id $sub.Name @('microsoft.compute/virtualmachines','microsoft.web/sites','microsoft.sql/servers','microsoft.compute/disks','microsoft.documentdb/databaseaccounts') { Analyze-UnderutilizedResources -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "Modernization"            $sub.Id $sub.Name { Analyze-Modernization          -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "DevOpsSecurity"           $sub.Id $sub.Name { Analyze-DevOpsSecurity         -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "ApplicationSecurity"      $sub.Id $sub.Name { Analyze-ApplicationSecurity    -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "DevOpsSecurity" $sub.Id $sub.Name @('microsoft.containerregistry/registries','microsoft.web/sites') { Analyze-DevOpsSecurity -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "ApplicationSecurity" $sub.Id $sub.Name @('microsoft.web/sites','microsoft.apimanagement/service') { Analyze-ApplicationSecurity -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "CostAdvisor"              $sub.Id $sub.Name { Analyze-CostAdvisor            -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "Reservations"             $sub.Id $sub.Name { Analyze-Reservations           -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "HybridInfrastructure"     $sub.Id $sub.Name { Analyze-HybridInfrastructure   -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStep "Reservations"             $sub.Id $sub.Name { Analyze-Reservations           -SubId $sub.Id -SubName $sub.Name -SkipTenantInventory }
+        Invoke-AnalysisStepForResourceTypes "HybridInfrastructure" $sub.Id $sub.Name @('microsoft.hybridcompute/machines','microsoft.network/expressroutecircuits','microsoft.network/virtualnetworkgateways') { Analyze-HybridInfrastructure -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "HighAvailability"         $sub.Id $sub.Name { Analyze-HighAvailability       -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "BCDR"                     $sub.Id $sub.Name { Analyze-BCDR                   -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "BCDR" $sub.Id $sub.Name @('microsoft.compute/virtualmachines','microsoft.recoveryservices/vaults') { Analyze-BCDR -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "ResourceLocks"            $sub.Id $sub.Name { Analyze-ResourceLocks          -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "ExpiringSecrets"          $sub.Id $sub.Name { Analyze-ExpiringSecrets        -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "ExpiringSecrets" $sub.Id $sub.Name 'microsoft.keyvault/vaults' { Analyze-ExpiringSecrets -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "Marketplace"              $sub.Id $sub.Name { Analyze-Marketplace            -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "AIFoundry" $sub.Id $sub.Name @('microsoft.cognitiveservices/accounts','microsoft.cognitiveservices/accounts/projects','microsoft.cognitiveservices/accounts/deployments','microsoft.machinelearningservices/workspaces') { Analyze-AIFoundry -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "TagCompliance"            $sub.Id $sub.Name { Analyze-TagCompliance          -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "DiagnosticSettings"       $sub.Id $sub.Name { Analyze-DiagnosticSettings     -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "DiagnosticSettings" $sub.Id $sub.Name @('microsoft.network/networksecuritygroups','microsoft.network/loadbalancers','microsoft.network/applicationgateways','microsoft.network/azurefirewalls','microsoft.sql/servers','microsoft.storage/storageaccounts','microsoft.compute/virtualmachines','microsoft.network/virtualnetworkgateways','microsoft.containerservice/managedclusters','microsoft.network/publicipaddresses','microsoft.web/sites','microsoft.network/frontdoors') { Analyze-DiagnosticSettings -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "PrivateEndpoints"         $sub.Id $sub.Name { Analyze-PrivateEndpoints       -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "PolicyCompliance"         $sub.Id $sub.Name { Analyze-PolicyCompliance       -SubId $sub.Id -SubName $sub.Name }
-        Invoke-AnalysisStep "CosmosOSSDatabase"        $sub.Id $sub.Name { Analyze-CosmosOSSDatabase      -SubId $sub.Id -SubName $sub.Name }
+        Invoke-AnalysisStepForResourceTypes "CosmosOSSDatabase" $sub.Id $sub.Name @('microsoft.documentdb/databaseaccounts','microsoft.dbforpostgresql/flexibleservers','microsoft.dbformysql/flexibleservers','microsoft.cache/redis') { Analyze-CosmosOSSDatabase -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "SubscriptionHygiene"      $sub.Id $sub.Name { Analyze-SubscriptionHygiene    -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "AdditionalChecks"         $sub.Id $sub.Name { Analyze-AdditionalChecks       -SubId $sub.Id -SubName $sub.Name }
         Invoke-AnalysisStep "CrossPillarCorrelation"   $sub.Id $sub.Name { Analyze-CrossPillarCorrelation -SubId $sub.Id -SubName $sub.Name }
+                $subscriptionFailures = @($script:StepResults | Where-Object { $_.Subscription -eq $sub.Name -and $_.Status -eq 'FAILED' })
+                $subscriptionStatus = if ($subscriptionFailures.Count -eq 0) { 'Completed' } else { 'Failed' }
+                $failureReason = if ($subscriptionFailures.Count -gt 0) { ($subscriptionFailures | ForEach-Object { "$($_.Step): $($_.Error)" }) -join '; ' } else { '' }
+                Save-SubscriptionCheckpoint -Subscription $sub -Status $subscriptionStatus -StartedAt $subscriptionStartedAt -FailureReason $failureReason | Out-Null
+                if (-not $WorkerMode) { Write-PartialAssessmentReport }
+                Complete-ExecutionProgressUnit
+            }
+            if ($abortRemainingSubscriptions) { break }
     }
 
+        if ($WorkerMode) {
+                Stop-KeepAlive
+                return
+        }
+
     # Generate reports
+            Write-PartialAssessmentReport -Force
+            Invoke-OptionalAdoptionAnalysis
     Invoke-AnalysisStep "Generate-HTMLReport"       "" "Reports" { Generate-HTMLReport }
     Invoke-AnalysisStep "Generate-ArchitectureDiagram" "" "Reports" { Generate-ArchitectureDiagram }
     Invoke-AnalysisStep "Generate-ExecutiveReport"  "" "Reports" { Generate-ExecutiveReport }
@@ -15322,10 +16729,10 @@ try {
 }
 
 # SIG # Begin signature block
-# MIIcEQYJKoZIhvcNAQcCoIIcAjCCG/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIIFrQYJKoZIhvcNAQcCoIIFnjCCBZoCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD59Y9oBpx/bj7p
-# 8SYPjkzJsqd2M6xzVWFlw2zuiwD4FqCCFlQwggMWMIIB/qADAgECAhB05LE1IRL+
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD96hdM1xu9L2Pr
+# f/KH88n5Ua6gX0Qx7pLBJ/1OaNeGZKCCAxowggMWMIIB/qADAgECAhB05LE1IRL+
 # rkeuEM34A+X/MA0GCSqGSIb3DQEBCwUAMCMxITAfBgNVBAMMGFBhYmxvQVIgQXp1
 # cmUgQXNzZXNzbWVudDAeFw0yNjA1MjMwMTM5MDdaFw0zMTA1MjMwMTQ5MDRaMCMx
 # ITAfBgNVBAMMGFBhYmxvQVIgQXp1cmUgQXNzZXNzbWVudDCCASIwDQYJKoZIhvcN
@@ -15342,134 +16749,15 @@ try {
 # WE2Clr69hUFDhhy/V1cpxZ+behL6/7ZMbf5cEHZ2frC1tWx1wAze71rTi+IvxRsK
 # D+0QeBdFQRJgLm1hldobGNWLUXDcP0NlaRLuMSA875ug6EWnG+k54di3BvWU4mDL
 # lH1NShfXEe6Eu7WpXJeuxpQ0PcAmaFLS8ExCY4yuBaqGgomeY0+0l+O7dNkm98Us
-# Zp7z6zCCBY0wggR1oAMCAQICEA6bGI750C3n79tQ4ghAGFowDQYJKoZIhvcNAQEM
-# BQAwZTELMAkGA1UEBhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0IEluYzEZMBcGA1UE
-# CxMQd3d3LmRpZ2ljZXJ0LmNvbTEkMCIGA1UEAxMbRGlnaUNlcnQgQXNzdXJlZCBJ
-# RCBSb290IENBMB4XDTIyMDgwMTAwMDAwMFoXDTMxMTEwOTIzNTk1OVowYjELMAkG
-# A1UEBhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0IEluYzEZMBcGA1UECxMQd3d3LmRp
-# Z2ljZXJ0LmNvbTEhMB8GA1UEAxMYRGlnaUNlcnQgVHJ1c3RlZCBSb290IEc0MIIC
-# IjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAv+aQc2jeu+RdSjwwIjBpM+zC
-# pyUuySE98orYWcLhKac9WKt2ms2uexuEDcQwH/MbpDgW61bGl20dq7J58soR0uRf
-# 1gU8Ug9SH8aeFaV+vp+pVxZZVXKvaJNwwrK6dZlqczKU0RBEEC7fgvMHhOZ0O21x
-# 4i0MG+4g1ckgHWMpLc7sXk7Ik/ghYZs06wXGXuxbGrzryc/NrDRAX7F6Zu53yEio
-# ZldXn1RYjgwrt0+nMNlW7sp7XeOtyU9e5TXnMcvak17cjo+A2raRmECQecN4x7ax
-# xLVqGDgDEI3Y1DekLgV9iPWCPhCRcKtVgkEy19sEcypukQF8IUzUvK4bA3VdeGbZ
-# OjFEmjNAvwjXWkmkwuapoGfdpCe8oU85tRFYF/ckXEaPZPfBaYh2mHY9WV1CdoeJ
-# l2l6SPDgohIbZpp0yt5LHucOY67m1O+SkjqePdwA5EUlibaaRBkrfsCUtNJhbesz
-# 2cXfSwQAzH0clcOP9yGyshG3u3/y1YxwLEFgqrFjGESVGnZifvaAsPvoZKYz0YkH
-# 4b235kOkGLimdwHhD5QMIR2yVCkliWzlDlJRR3S+Jqy2QXXeeqxfjT/JvNNBERJb
-# 5RBQ6zHFynIWIgnffEx1P2PsIV/EIFFrb7GrhotPwtZFX50g/KEexcCPorF+CiaZ
-# 9eRpL5gdLfXZqbId5RsCAwEAAaOCATowggE2MA8GA1UdEwEB/wQFMAMBAf8wHQYD
-# VR0OBBYEFOzX44LScV1kTN8uZz/nupiuHA9PMB8GA1UdIwQYMBaAFEXroq/0ksuC
-# MS1Ri6enIZ3zbcgPMA4GA1UdDwEB/wQEAwIBhjB5BggrBgEFBQcBAQRtMGswJAYI
-# KwYBBQUHMAGGGGh0dHA6Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBDBggrBgEFBQcwAoY3
-# aHR0cDovL2NhY2VydHMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0QXNzdXJlZElEUm9v
-# dENBLmNydDBFBgNVHR8EPjA8MDqgOKA2hjRodHRwOi8vY3JsMy5kaWdpY2VydC5j
-# b20vRGlnaUNlcnRBc3N1cmVkSURSb290Q0EuY3JsMBEGA1UdIAQKMAgwBgYEVR0g
-# ADANBgkqhkiG9w0BAQwFAAOCAQEAcKC/Q1xV5zhfoKN0Gz22Ftf3v1cHvZqsoYcs
-# 7IVeqRq7IviHGmlUIu2kiHdtvRoU9BNKei8ttzjv9P+Aufih9/Jy3iS8UgPITtAq
-# 3votVs/59PesMHqai7Je1M/RQ0SbQyHrlnKhSLSZy51PpwYDE3cnRNTnf+hZqPC/
-# Lwum6fI0POz3A8eHqNJMQBk1RmppVLC4oVaO7KTVPeix3P0c2PR3WlxUjG/voVA9
-# /HYJaISfb8rbII01YBwCA8sgsKxYoA5AY8WYIsGyWfVVa88nq2x2zm8jLfR+cWoj
-# ayL/ErhULSd+2DrZ8LaHlv1b0VysGMNNn3O3AamfV6peKOK5lDCCBrQwggScoAMC
-# AQICEA3HrFcF/yGZLkBDIgw6SYYwDQYJKoZIhvcNAQELBQAwYjELMAkGA1UEBhMC
-# VVMxFTATBgNVBAoTDERpZ2lDZXJ0IEluYzEZMBcGA1UECxMQd3d3LmRpZ2ljZXJ0
-# LmNvbTEhMB8GA1UEAxMYRGlnaUNlcnQgVHJ1c3RlZCBSb290IEc0MB4XDTI1MDUw
-# NzAwMDAwMFoXDTM4MDExNDIzNTk1OVowaTELMAkGA1UEBhMCVVMxFzAVBgNVBAoT
-# DkRpZ2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRp
-# bWVTdGFtcGluZyBSU0E0MDk2IFNIQTI1NiAyMDI1IENBMTCCAiIwDQYJKoZIhvcN
-# AQEBBQADggIPADCCAgoCggIBALR4MdMKmEFyvjxGwBysddujRmh0tFEXnU2tjQ2U
-# tZmWgyxU7UNqEY81FzJsQqr5G7A6c+Gh/qm8Xi4aPCOo2N8S9SLrC6Kbltqn7SWC
-# WgzbNfiR+2fkHUiljNOqnIVD/gG3SYDEAd4dg2dDGpeZGKe+42DFUF0mR/vtLa4+
-# gKPsYfwEu7EEbkC9+0F2w4QJLVSTEG8yAR2CQWIM1iI5PHg62IVwxKSpO0XaF9DP
-# fNBKS7Zazch8NF5vp7eaZ2CVNxpqumzTCNSOxm+SAWSuIr21Qomb+zzQWKhxKTVV
-# gtmUPAW35xUUFREmDrMxSNlr/NsJyUXzdtFUUt4aS4CEeIY8y9IaaGBpPNXKFifi
-# nT7zL2gdFpBP9qh8SdLnEut/GcalNeJQ55IuwnKCgs+nrpuQNfVmUB5KlCX3ZA4x
-# 5HHKS+rqBvKWxdCyQEEGcbLe1b8Aw4wJkhU1JrPsFfxW1gaou30yZ46t4Y9F20HH
-# fIY4/6vHespYMQmUiote8ladjS/nJ0+k6MvqzfpzPDOy5y6gqztiT96Fv/9bH7mQ
-# yogxG9QEPHrPV6/7umw052AkyiLA6tQbZl1KhBtTasySkuJDpsZGKdlsjg4u70Ew
-# gWbVRSX1Wd4+zoFpp4Ra+MlKM2baoD6x0VR4RjSpWM8o5a6D8bpfm4CLKczsG7Zr
-# IGNTAgMBAAGjggFdMIIBWTASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBTv
-# b1NK6eQGfHrK4pBW9i/USezLTjAfBgNVHSMEGDAWgBTs1+OC0nFdZEzfLmc/57qY
-# rhwPTzAOBgNVHQ8BAf8EBAMCAYYwEwYDVR0lBAwwCgYIKwYBBQUHAwgwdwYIKwYB
-# BQUHAQEEazBpMCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20w
-# QQYIKwYBBQUHMAKGNWh0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2Vy
-# dFRydXN0ZWRSb290RzQuY3J0MEMGA1UdHwQ8MDowOKA2oDSGMmh0dHA6Ly9jcmwz
-# LmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRSb290RzQuY3JsMCAGA1UdIAQZ
-# MBcwCAYGZ4EMAQQCMAsGCWCGSAGG/WwHATANBgkqhkiG9w0BAQsFAAOCAgEAF877
-# FoAc/gc9EXZxML2+C8i1NKZ/zdCHxYgaMH9Pw5tcBnPw6O6FTGNpoV2V4wzSUGvI
-# 9NAzaoQk97frPBtIj+ZLzdp+yXdhOP4hCFATuNT+ReOPK0mCefSG+tXqGpYZ3ess
-# BS3q8nL2UwM+NMvEuBd/2vmdYxDCvwzJv2sRUoKEfJ+nN57mQfQXwcAEGCvRR2qK
-# tntujB71WPYAgwPyWLKu6RnaID/B0ba2H3LUiwDRAXx1Neq9ydOal95CHfmTnM4I
-# +ZI2rVQfjXQA1WSjjf4J2a7jLzWGNqNX+DF0SQzHU0pTi4dBwp9nEC8EAqoxW6q1
-# 7r0z0noDjs6+BFo+z7bKSBwZXTRNivYuve3L2oiKNqetRHdqfMTCW/NmKLJ9M+Mt
-# ucVGyOxiDf06VXxyKkOirv6o02OoXN4bFzK0vlNMsvhlqgF2puE6FndlENSmE+9J
-# GYxOGLS/D284NHNboDGcmWXfwXRy4kbu4QFhOm0xJuF2EZAOk5eCkhSxZON3rGlH
-# qhpB/8MluDezooIs8CVnrpHMiD2wL40mm53+/j7tFaxYKIqL0Q4ssd8xHZnIn/7G
-# ELH3IdvG2XlM9q7WP/UwgOkw/HQtyRN62JK4S1C8uw3PdBunvAZapsiI5YKdvlar
-# Evf8EA+8hcpSM9LHJmyrxaFtoza2zNaQ9k+5t1wwggbtMIIE1aADAgECAhAIT9wz
-# T35FTtvDD4/5khg1MA0GCSqGSIb3DQEBCwUAMGkxCzAJBgNVBAYTAlVTMRcwFQYD
-# VQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBH
-# NCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYgMjAyNSBDQTEwHhcNMjYwODA1
-# MDAwMDAwWhcNMzcxMTA0MjM1OTU5WjBjMQswCQYDVQQGEwJVUzEXMBUGA1UEChMO
-# RGlnaUNlcnQsIEluYy4xOzA5BgNVBAMTMkRpZ2lDZXJ0IFNIQTI1NiBSU0E0MDk2
-# IFRpbWVzdGFtcCBSZXNwb25kZXIgMjAyNiAxMIICIjANBgkqhkiG9w0BAQEFAAOC
-# Ag8AMIICCgKCAgEAtnum8sn+zUr41JtMZbP9OMYw+HwJDpG5xkIu/lqcfNYmMX81
-# YmsUiHLbh9ykpeWBGKTLhYBrAN9Tdg/QEzG32XcObmgIblnr0CoQ3WSAeDZ6nH6X
-# 6VkFyYkJw3QBJREwvm4UhLzSxmwPA7cFKRTEOMsmEEj6qJk/dqLEAL+oQYuOwE2U
-# uiX1Vnul8YReIyWd4kgLn9gq6LNXM0UplkR6jL/QHxmb6fMoGBJYbnaUI7XD6cKD
-# pekK2SVMld4iDbzeHDtOaaxldH5IxuNusQ69nd8/ZXEiB5Hbxj3RlK13cX1W4DlF
-# XKdv/CEhM8Cj1vvlmvhNroyPdRGbbpBlgyf8Wdu5N6ByhFwURn0U6ozlPoxN22v+
-# fviUhP+6DR547OZnpBMWDfei1f5sVGwiiW/KQTWOK97g+4RJpPzPNV4VYMAwO2jM
-# 2Aty2QYPVmOQTJm0msuXnJrSbl2gf9JylpkJlWXqk1Q4LJsxz+TELoQCZIljbgvT
-# JgoPU2R12ydv8i1UqL/adelA0y7U9Pmmtbze9Xx3rtajC5SzQd1jgfwAwsa90v9Y
-# cSPdmeoyoBBA/27cCL237l5DTYYPDLQ4ON3OLTGWnvRb6jDrf/T75gMRfUzSLCBQ
-# fBusm9+mSWRlC/Df6S/e9Q8i13CuhzOT2Jx+V/nlbXM4QoBwlUAhelwwJT0CAwEA
-# AaOCAZUwggGRMAwGA1UdEwEB/wQCMAAwHQYDVR0OBBYEFBTJY4owLtRK+26U8+bj
-# QH717M3iMB8GA1UdIwQYMBaAFO9vU0rp5AZ8esrikFb2L9RJ7MtOMA4GA1UdDwEB
-# /wQEAwIHgDAWBgNVHSUBAf8EDDAKBggrBgEFBQcDCDCBlQYIKwYBBQUHAQEEgYgw
-# gYUwJAYIKwYBBQUHMAGGGGh0dHA6Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBdBggrBgEF
-# BQcwAoZRaHR0cDovL2NhY2VydHMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3Rl
-# ZEc0VGltZVN0YW1waW5nUlNBNDA5NlNIQTI1NjIwMjVDQTEuY3J0MF8GA1UdHwRY
-# MFYwVKBSoFCGTmh0dHA6Ly9jcmwzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0
-# ZWRHNFRpbWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYyMDI1Q0ExLmNybDAgBgNVHSAE
-# GTAXMAgGBmeBDAEEAjALBglghkgBhv1sBwEwDQYJKoZIhvcNAQELBQADggIBAI3F
-# OmEenVIK35msCYB+fShAsWvSYvLBItoNdAgQ2jIqrGsVsluXMJU/+mRebBc52s6l
-# bKAvOVPXaizmKkMLLflEEKDZQx4CkS2t8aHPjkXha3hYZ010htFa3dhNgmalH5vu
-# Wvh3tTCf4frTS7gPtGc4Z/xaPhQ2AB1mR8eEe/WbH0RWHvVIl6VwQ3+g5FKNfN2N
-# /DWJkf13w2H+2GfqEfbd35Ww8CvoYBjLNIDTadcPWdgsjsiOaK/7EsKJgLjUNIVg
-# vcaFOLLQ/GlrA+0ZHJoFUbOr5SJN8zykPspXIXlpDJY/gqFUZRROeab9GVgmhbdO
-# JcD/63RhxPahFUGbckRONqMe6DYAv6/mOG0pWd3cPStsdcS7buj5DyniwRY8yooM
-# H6ptx5vpP/pZzBPBeZD2U4IsthyxB5Jaa8qrOkB5z160TXiM5ADMspZ0TfD9MJoq
-# 0tFpFPssKRFhWeEDYPvcUuN7U7lvcdHl4ezQ3NT/7Ffs1sR1yh/LRbdZ3B3Vc6q2
-# WmD8mDC0p9kzl2o73iVtS946IkEj7FkRsZGww1teYxERROC745xrtjvcw9ZyyUjH
-# ZWGRIpJeMNsPquCDf0fkyHtB+J4AiNZqCQk23rxh+KbpyMTNVKItJ5l92Svl20U9
-# NbqMBOVYl1h54NEYLJq1/xHWFKPNK903zJZA9P2DMYIFEzCCBQ8CAQEwNzAjMSEw
-# HwYDVQQDDBhQYWJsb0FSIEF6dXJlIEFzc2Vzc21lbnQCEHTksTUhEv6uR64QzfgD
-# 5f8wDQYJYIZIAWUDBAIBBQCggYQwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKAADAZ
-# BgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYKKwYB
-# BAGCNwIBFTAvBgkqhkiG9w0BCQQxIgQgCMqR8WCEKN55KL3odyZdBXWI5Dla99d+
-# qOUZCwpsSCAwDQYJKoZIhvcNAQEBBQAEggEAkzR5auQFvqNGg/rrqykZbtQUFblw
-# +nI1/x5hzbLhI1PPeZK2eC3aw6JqoNequcUDVNGNSC0Sv2wPLj0yXjOuxpAMhkz+
-# K9C+JEWh5c+DGIy6MPGtOb0P4fMLO2Je91hwa2UqTFl8Av6q+OdC1BDYD77BhaYU
-# XrEZcC0E+FQVNI5ZCX92v9HyGegj4gYqfih+SyIeLM/MqdUC28/V5ItqSokyBfz1
-# O5lI9hMw9sxdiBFdsLyG5IANUIneYQ4REgTGP3kMlZqk3sXs5HPnMrHLgwIkhuyF
-# G+F5qptiNudX/ZxQNV8yZINA+XUh2aOe6EqfFwC8eVBncKyLzox7wDhWLaGCAyYw
-# ggMiBgkqhkiG9w0BCQYxggMTMIIDDwIBATB9MGkxCzAJBgNVBAYTAlVTMRcwFQYD
-# VQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBH
-# NCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYgMjAyNSBDQTECEAhP3DNPfkVO
-# 28MPj/mSGDUwDQYJYIZIAWUDBAIBBQCgaTAYBgkqhkiG9w0BCQMxCwYJKoZIhvcN
-# AQcBMBwGCSqGSIb3DQEJBTEPFw0yNjA5MDkxNjA2MTJaMC8GCSqGSIb3DQEJBDEi
-# BCDX1UJNe2X2eVD9e5mYAQd6FLDscQqMwOrX2u//yJuA2TANBgkqhkiG9w0BAQEF
-# AASCAgBDLqvifptDWKZUtw8x2EipjfdhgyzAl6KmcGXwq/7j1dcVOtAI1wuDqybD
-# wVRUL3LAtitvqphnzeQhNoWPdYHtLZg2tDRTQXSwYhXPyxtWs4s8eiOPJ0wbvhQE
-# 7QM8SeBQl14y1s37yTAikdERNDWBs/49N6WKAvCn3EuyZK0g30KI6oyNAfSSvLn7
-# rzfaGjln/BkE4UWwTy+B1jgJOlWD1wH69A0Xirqh/NQVwj9pADpEceBOpgZ0m5tK
-# dQVKkxBoK28hh7SBuFE3CYZquuvNkkx9nxJfs25RgrX/8RXOSmynm3DnKg2jQmtb
-# y+AM+n6WcNymwEfN52LjJMtmUKKkE2CNZwPUOJbAenSMKEpbmGSOLwJOe9DwfagD
-# uDdcD1Ss6KjDkifs92OOdtXpNbIv+E8Wd+iQDEQjabtfquGvpAj+srKlnIa44Zg9
-# idgpKXZjc0BwcQg83CiCfLmBazv9wHwwTvNXrZ/MBDTilz/zRgPsBW+n7Bym5YDg
-# THSkA0gHPwBrnA4X5vyVF1oNe1fN3jXHy45Yl6MJmV8ES0Dd4OqbfCq+8SKkLaMi
-# NM8BEqDl4WhhTafch6AGJF3Kfu94AWQpkssRsQDxYmrRJPe2brq/3D34q2iC0OlC
-# +Fqu0J4jfK1ZnXT4vQefvf4GjRHXXFSDGB2QcWKOOX4xlFByuw==
+# Zp7z6zGCAekwggHlAgEBMDcwIzEhMB8GA1UEAwwYUGFibG9BUiBBenVyZSBBc3Nl
+# c3NtZW50AhB05LE1IRL+rkeuEM34A+X/MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisG
+# AQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQw
+# HAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIIxS
+# zkwtl36NbDJ561hKK9HM3k7PfJB47caHQCOILORgMA0GCSqGSIb3DQEBAQUABIIB
+# AKZLdQXrU6KbGF/7cKWl0SkuaTro7bbT5ZbMplu/8eRr5tbg9byUHXDKDmNc6Zyf
+# cdTS/30ZtpgMD0gcj8v9pEgRiXJfKGCBnkww+Rv2qsRh6+rpua4Vhci5lIsRauLu
+# pbBhZZ47776jWzS8iqw63LZ5SF/92A7rOeXcnAizCMviyiDnr0JrAa0fA61yMy28
+# acXq75B6dQfQ2Gqxyq8tlMFGyDAOD9zDVEEVLwhuQj7MQ3klCVKJxnu+Pf+8Eigm
+# L4RIPGHjIo3BHJ7RHzxGWrdQj7BBqUf+c8aMtUg+vI8bd0LgmRar7ueiqQJ7ugIv
+# RPLK2EfeNi2SyXY7/9P3iek=
 # SIG # End signature block

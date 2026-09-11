@@ -85,11 +85,19 @@ The script requires **read-only** access. No write permissions are needed.
 ### Local Machine
 
 ```powershell
-# 1. Authenticate to Azure
-Connect-AzAccount
+# 1. Start PowerShell 7 and run against the customer's tenant
+pwsh
+./Azure-Tenant-Assessment.ps1 -TenantId '<customer-tenant-id>' -UseDeviceAuthentication -SkipGraphLogin
+```
 
-# 2. Run the assessment
-./Azure-Tenant-Assessment.ps1
+The script installs the Az rollup in `CurrentUser` scope when it is missing. In restricted environments, install it before the assessment:
+
+```powershell
+Install-Module Az -Scope CurrentUser -Force -AllowClobber
+Connect-AzAccount -Tenant '<customer-tenant-id>' -UseDeviceAuthentication
+
+# Reuse that session without another Azure login
+./Azure-Tenant-Assessment.ps1 -SkipLogin -TenantId '<customer-tenant-id>' -SkipGraphLogin
 ```
 
 ### Common Options
@@ -97,6 +105,21 @@ Connect-AzAccount
 ```powershell
 # Assess a single subscription
 ./Azure-Tenant-Assessment.ps1 -SkipLogin -SubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Assess selected subscriptions in batches with isolated parallel workers
+./Azure-Tenant-Assessment.ps1 -SkipLogin `
+	-SubscriptionId @('sub-id-1','sub-id-2','sub-id-3') `
+	-BatchSize 20 -MaxParallelism 4 -OutputPath './LargeTenant'
+
+# Resume an interrupted run using the same output and checkpoint paths
+./Azure-Tenant-Assessment.ps1 -SkipLogin -Resume `
+	-OutputPath './LargeTenant' -CheckpointPath './LargeTenant/.checkpoint' `
+	-BatchSize 20 -MaxParallelism 4
+
+# Retry only subscriptions whose last checkpoint is Failed
+./Azure-Tenant-Assessment.ps1 -SkipLogin -RetryFailedOnly `
+	-OutputPath './LargeTenant' -CheckpointPath './LargeTenant/.checkpoint' `
+	-MaxParallelism 4
 
 # Fast mode — skip Azure Monitor metrics collection
 ./Azure-Tenant-Assessment.ps1 -SkipLogin -SkipMetrics
@@ -112,15 +135,48 @@ Connect-AzAccount
 
 # Use 60 days of eligible usage for commitment purchase recommendations
 ./Azure-Tenant-Assessment.ps1 -CommitmentLookbackDays 60
+
+# Azure AI inventory and best-practice checks are automatic and reuse Resource Graph.
+# Add Azure Monitor utilization metrics only when required.
+./Azure-Tenant-Assessment.ps1 -IncludeAIMetrics -MetricDays 7
+
+# Lightweight GitHub governance (one organization request; no repository crawl)
+$env:GH_TOKEN = '<fine-grained token>' # GITHUB_TOKEN or `gh auth login` are also supported
+./Azure-Tenant-Assessment.ps1 -GitHubOrganization @('contoso')
+
+# Add the latest aggregate 28-day GitHub Copilot report
+./Azure-Tenant-Assessment.ps1 -GitHubOrganization @('contoso') -IncludeGitHubCopilot
+
+# Aggregate Microsoft 365 Copilot adoption (requires Graph Reports.Read.All)
+./Azure-Tenant-Assessment.ps1 -IncludeM365Copilot -CopilotUsagePeriod D28
 ```
+
+Azure AI inventory and configuration checks reuse the existing Resource Graph result and add no Azure API calls. `-IncludeAIMetrics` performs at most one metric-definition request and one batched metric request per discovered AI account. GitHub and Copilot integrations run once in the coordinator, never once per subscription or worker.
+
+External integrations are optional and non-blocking. GitHub credentials are read from `GH_TOKEN`, `GITHUB_TOKEN`, or an existing `gh auth login` session; Microsoft 365 Copilot uses an existing Microsoft Graph session with `Reports.Read.All`, `M365_COPILOT_ACCESS_TOKEN`, or the current Az Graph token. Tokens are never written to worker configuration, checkpoints, logs, or reports. Remove environment tokens after execution when they are no longer required.
 
 ### All Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `-SubscriptionId` | string | *(all)* | Analyze a specific subscription only |
+| `-SubscriptionId` | string[] | *(all)* | Analyze one or more subscription IDs |
 | `-SkipLogin` | switch | false | Explicitly skip `Connect-AzAccount`; Cloud Shell sessions are detected automatically |
+| `-TenantId` | string | *(current tenant)* | Authenticate to and assess an explicit Microsoft Entra tenant |
+| `-UseDeviceAuthentication` | switch | false | Use device-code Azure authentication when a browser cannot open locally |
+| `-SkipGraphLogin` | switch | false | Skip optional interactive Microsoft Graph login; CA/PIM remain manual checks when token reuse is unavailable |
 | `-OutputPath` | string | `./AzureAssessment_<timestamp>` | Output directory for all generated files |
+| `-BatchSize` | int | `20` | Maximum subscriptions in each processing batch |
+| `-MaxParallelism` | int | `1` | Isolated subscription worker processes; use `3`–`5` for large tenants to limit API throttling |
+| `-WorkerTimeoutMinutes` | int | `180` | Maximum runtime for one isolated subscription worker before it is terminated and checkpointed as failed |
+| `-ProgressIntervalSeconds` | int | `60` | Interval (30–900 seconds) for subscription progress, elapsed time, ETA, and estimated finish updates |
+| `-IncludeAIMetrics` | switch | false | Query supported Azure Monitor usage, latency, availability, safety, and PTU metrics for discovered AI accounts |
+| `-GitHubOrganization` | string[] | *(none)* | Run one lightweight governance query per organization using `GITHUB_TOKEN` or an existing `gh` login |
+| `-IncludeGitHubCopilot` | switch | false | Download the latest aggregate 28-day Copilot report for each specified GitHub organization |
+| `-IncludeM365Copilot` | switch | false | Query aggregate Microsoft 365 Copilot adoption; requires Microsoft Graph `Reports.Read.All` |
+| `-CopilotUsagePeriod` | string | `D28` | Microsoft 365 Copilot report period: `D7`, `D28`, `D90`, or `D180` |
+| `-CheckpointPath` | string | `<OutputPath>/.checkpoint` | Persistent checkpoint and per-subscription JSON directory |
+| `-Resume` | switch | false | Restore completed subscriptions and process pending or failed subscriptions |
+| `-RetryFailedOnly` | switch | false | Restore completed results and process only subscriptions whose latest checkpoint failed |
 | `-SkipMetrics` | switch | false | Skip Azure Monitor metrics collection (faster execution) |
 | `-SkipKeyVaultDataPlane` | switch | false | Skip Key Vault secret/certificate enumeration |
 | `-SkipBackupDetails` | switch | false | Skip detailed backup item enumeration |
@@ -207,11 +263,12 @@ Purchase recommendations come from Azure's billing recommendation engines rather
 
 - **Reservations** use `Microsoft.Consumption/reservationRecommendations` to compare actual PAYG cost against 1-year and 3-year reservation scenarios by SKU, family, region, quantity, and scope.
 - **Savings Plans** use `Microsoft.CostManagement/benefitRecommendations` with hourly eligible charges, commitment amount, coverage, projected utilization, wastage, and 1-year/3-year terms.
+- **Existing Reservations** use 30 daily summaries from `Microsoft.Consumption/reservationSummaries` to report reserved hours, used hours, unused hours, and weighted utilization. If summary access is unavailable, the inventory falls back to the 7-day utilization aggregate from `Microsoft.Capacity`.
 - Existing eligible Reservations and Savings Plans are accounted for by Azure's recommendation model.
 - A recommendation must meet conservative savings and utilization thresholds. Matching underutilized VMs are marked `Review first` so rightsizing happens before commitment purchase.
 - Only one overlapping option per subscription is marked `Preferred`; other valid options remain visible as alternatives.
 
-These recommendations support financial review and do not purchase or modify any Azure benefit.
+Unused hours quantify idle committed capacity, not an exact currency loss. Realized monetary savings require reservation purchase charges and the customer's billing agreement, so the report does not manufacture a dollar estimate. These recommendations support financial review and do not purchase or modify any Azure benefit.
 
 ### Microsoft Graph (Optional)
 If the `Microsoft.Graph.Authentication` module is installed, the script auto-connects to verify:
@@ -244,6 +301,8 @@ The script is digitally signed with an Authenticode certificate. The signature g
 
 At startup, the script checks its Authenticode signature when the host supports it. By default, an invalid, missing, or untrusted signature produces a warning and execution continues. This avoids blocking execution on customer workstations that do not trust the author's certificate.
 
+Do not use `-RequireValidSignature` on a customer workstation unless the signing certificate is trusted there. Windows execution policy is evaluated before the script starts and cannot be overridden by script code. For a downloaded file, inspect it and remove the Mark of the Web with `Unblock-File .\Azure-Tenant-Assessment.ps1`. If organizational `MachinePolicy` or `UserPolicy` blocks scripts, the customer's administrator must allow execution.
+
 Use strict enforcement when the signing certificate is trusted on the computer:
 
 ```powershell
@@ -267,7 +326,12 @@ The script is distributed as **plain-text PowerShell** with no encoding, compres
 
 For large tenants (50+ subscriptions), execution can take several hours. The script includes built-in resilience:
 
-- **Keep-alive heartbeat** — writes to console every 30 seconds to prevent Cloud Shell idle timeout (20 minutes)
+- **Resource-aware execution** — skips detailed collection and analysis modules when Resource Graph confirms the applicable resource type does not exist
+- **Centralized inventory reuse** — reuses resource, tag, Marketplace, private endpoint, and resource-group data instead of listing the same resources repeatedly
+- **Diagnostic settings fast path** — treats an empty successful Resource Graph result as authoritative, avoiding one API call per resource
+- **Tenant-wide benefit cache** — queries Reservations and Savings Plans inventory once, including when no benefits exist
+- **Keep-alive heartbeat** — writes to console at `-ProgressIntervalSeconds` intervals to prevent Cloud Shell idle timeout
+- **Persistent default output** — when `$HOME/clouddrive` is mounted and `-OutputPath` is omitted, reports and checkpoints are stored there automatically
 - **Session reuse** — detects the authenticated Cloud Shell context and avoids a duplicate `Connect-AzAccount` session
 - **Token refresh** — automatically refreshes Azure access tokens every 15 minutes to prevent expiration
 - **Network retry** — retries subscription context switches up to 3 times with exponential backoff on transient DNS/network failures
@@ -276,14 +340,28 @@ For large tenants (50+ subscriptions), execution can take several hours. The scr
 **Recommendation:** For sessions exceeding 2 hours, run inside `tmux` to survive browser disconnections:
 
 ```bash
+cd "$HOME/clouddrive"
 tmux new -s assessment
 pwsh
-./Azure-Tenant-Assessment.ps1 -SkipLogin
+./Azure-Tenant-Assessment.ps1 -SkipLogin -MaxParallelism 3 -BatchSize 20
 ```
 
 ---
 
 ## Execution Time
+
+### Resumable large-tenant execution
+
+After every subscription, the assessment writes an atomic JSON checkpoint and refreshes:
+
+- `Assessment_Partial.html` — progress dashboard refreshed at the configured progress interval
+- `Assessment_Partial.json` — current consolidated findings and resources
+- `Findings_Partial.csv` — findings collected so far
+- `.checkpoint/subscriptions/<subscription-id>.json` — complete per-subscription result
+- `.checkpoint/manifest.json` — completed, failed, and pending status
+- `.checkpoint/consolidated.json` — final consolidated result after report generation
+
+Parallel mode uses separate PowerShell processes, so each subscription has an isolated Az context and script state. The authenticated context is exported to a temporary file only while workers run and is deleted afterward. Start with `-MaxParallelism 3`; increase to `5` only when Azure API throttling remains low.
 
 | Tenant Size | Estimated Time | With `-SkipMetrics` |
 |-------------|----------------|---------------------|
@@ -291,7 +369,7 @@ pwsh
 | 10–20 subscriptions | 15–45 minutes | 5–15 minutes |
 | 50+ subscriptions | 1–4 hours | 30–60 minutes |
 
-Metrics collection (`Get-AzMetric`) is the most time-consuming operation. Use `-SkipMetrics` for a faster initial assessment, then run with metrics enabled for the full analysis.
+Metrics collection (`Get-AzMetric`) remains the most time-consuming operation when applicable resources exist. Use `-SkipMetrics` for a faster initial assessment. For the shortest read-only posture run, combine it with `-SkipKeyVaultDataPlane` and `-SkipBackupDetails`; resource-type skips are applied automatically in every mode.
 
 ---
 
