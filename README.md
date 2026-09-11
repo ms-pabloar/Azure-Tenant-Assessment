@@ -2,6 +2,8 @@
 
 **Automated Azure tenant-wide analysis aligned with the Microsoft Azure Well-Architected Framework (WAF), Zero Trust security model, and Azure Landing Zone (ALZ) best practices.**
 
+**Current release:** [v5.7](https://github.com/ms-pabloar/Azure-Tenant-Assessment/releases/tag/v5.7)
+
 > **This script is read-only and does NOT deploy, modify, create, or delete any Azure resource.** It performs analysis exclusively through read-only API calls (`GET` requests and Azure Resource Graph queries). Your environment remains completely unchanged after execution.
 
 ---
@@ -164,7 +166,7 @@ External integrations are optional and non-blocking. GitHub credentials are read
 | `-TenantId` | string | *(current tenant)* | Authenticate to and assess an explicit Microsoft Entra tenant |
 | `-UseDeviceAuthentication` | switch | false | Use device-code Azure authentication when a browser cannot open locally |
 | `-SkipGraphLogin` | switch | false | Skip optional interactive Microsoft Graph login; CA/PIM remain manual checks when token reuse is unavailable |
-| `-OutputPath` | string | `./AzureAssessment_<timestamp>` | Output directory for all generated files |
+| `-OutputPath` | string | `./AzureAssessment_<timestamp>` | Output directory; when omitted in Cloud Shell, defaults to `$HOME/clouddrive/AzureAssessment_<timestamp>` if the persistent drive is mounted |
 | `-BatchSize` | int | `20` | Maximum subscriptions in each processing batch |
 | `-MaxParallelism` | int | `1` | Isolated subscription worker processes; use `3`–`5` for large tenants to limit API throttling |
 | `-WorkerTimeoutMinutes` | int | `180` | Maximum runtime for one isolated subscription worker before it is terminated and checkpointed as failed |
@@ -191,6 +193,7 @@ External integrations are optional and non-blocking. GitHub credentials are read
 | `-DiskLowIops` | int | 5 | Disk IOPS threshold |
 | `-IncludeALZ` | switch | false | Backward compatibility flag (ALZ runs by default) |
 | `-MandatoryTags` | string[] | `Environment, Owner, CostCenter, Application, Department` | Required tags for compliance |
+| `-RequireValidSignature` | switch | false | Block execution unless Authenticode reports the script signature as `Valid` |
 
 ---
 
@@ -286,10 +289,10 @@ If the `Microsoft.Graph.Authentication` module is installed, the script auto-con
 - **Does NOT modify** any configurations, settings, or policies
 - **Does NOT delete** any resources or data
 - **Does NOT write** to any Azure storage, database, or service
-- **Does NOT send** data to any external endpoint — all output stays local
+- **Does NOT upload** assessment results or discovered tenant data to third-party endpoints; generated output stays local
 - **Does NOT require** or use any write permissions
 
-The script operates exclusively through **read-only API calls** (`GET` requests, Resource Graph queries, and Azure Monitor metric reads).
+The script operates exclusively through **read-only API operations** (`GET` requests, read-only query `POST` requests, Resource Graph queries, and Azure Monitor metric reads). Optional GitHub and Microsoft Graph integrations query only the explicitly enabled governance and aggregate adoption endpoints.
 
 ### Authenticode Signature
 
@@ -355,7 +358,7 @@ pwsh
 After every subscription, the assessment writes an atomic JSON checkpoint and refreshes:
 
 - `Assessment_Partial.html` — progress dashboard refreshed at the configured progress interval
-- `Assessment_Partial.json` — current consolidated findings and resources
+- `Assessment_Partial.json` — bounded progress summary with subscription states and references to per-subscription checkpoint data
 - `Findings_Partial.csv` — findings collected so far
 - `.checkpoint/subscriptions/<subscription-id>.json` — complete per-subscription result
 - `.checkpoint/manifest.json` — completed, failed, and pending status
