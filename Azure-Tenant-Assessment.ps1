@@ -17,7 +17,7 @@
     - Complete inventory of resources, configurations, and detected issues
 .NOTES
     Author: Azure Assessment Tool
-    Version: 5.7
+    Version: 5.8
     Requiere: Az PowerShell Modules (Az.Accounts, Az.Compute, Az.Network, Az.Sql,
               Az.Storage, Az.KeyVault, Az.Monitor, Az.Security, Az.Aks,
               Az.OperationalInsights, Az.RecoveryServices, Az.ResourceGraph)
@@ -10387,6 +10387,60 @@ function Generate-HTMLReport {
     }
     $hygieneRows = $hygieneRowsBuilder.ToString()
 
+    # ── Azure AI & Copilot blade data ──
+    $aiInventory = @($script:AIServiceInventory)
+    $aiUsage = @($script:AIUsageData)
+    $githubCopilotData = @($script:AdoptionData.GitHubCopilot)
+    $m365CopilotData = $script:AdoptionData.Microsoft365Copilot
+    $aiCopilotFindings = @($script:Findings | Where-Object { $_.Category -match '^(AI -|GitHub Copilot|Microsoft 365 Copilot)' })
+    $aiDeploymentCount = @($aiInventory | Where-Object { $_.ResourceType -match '/deployments$' }).Count
+    $githubCopilotActiveUsers = [int](($githubCopilotData | Where-Object { $_.Status -ne 'Unavailable' } | Measure-Object -Property MonthlyActiveUsers -Sum).Sum)
+    $m365CopilotActiveUsers = if ($m365CopilotData -and $m365CopilotData.Status -eq 'Available') { [int]$m365CopilotData.ActiveUsers } else { 0 }
+
+    $aiInventoryRowsBuilder = [System.Text.StringBuilder]::new()
+    foreach ($item in ($aiInventory | Sort-Object Subscription, Name)) {
+        $modelVersionDisplay = if ($item.ModelVersion) { " <small style=`"color:var(--text-dim)`">$(ConvertTo-SafeHtml $item.ModelVersion)</small>" } else { '' }
+        $modelDisplay = if ($item.Model) { "$(ConvertTo-SafeHtml $item.Model)$modelVersionDisplay" } else { '<span style="color:var(--text-dim)">N/A</span>' }
+        [void]$aiInventoryRowsBuilder.Append("<tr class=`"ai-inventory-row`"><td><strong>$(ConvertTo-SafeHtml $item.Name)</strong></td><td>$(ConvertTo-SafeHtml $item.ResourceGroup)</td><td>$(ConvertTo-SafeHtml $item.Kind)</td><td>$modelDisplay</td><td>$(ConvertTo-SafeHtml $item.Sku)</td><td>$(ConvertTo-SafeHtml $item.Location)</td><td>$(ConvertTo-SafeHtml $item.Subscription)</td></tr>")
+    }
+    $aiInventoryRows = $aiInventoryRowsBuilder.ToString()
+
+    $aiUsageRowsBuilder = [System.Text.StringBuilder]::new()
+    foreach ($item in ($aiUsage | Sort-Object Subscription, ResourceName)) {
+        $requestsDisplay = if ($null -ne $item.Requests) { ([double]$item.Requests).ToString('N0', [System.Globalization.CultureInfo]::InvariantCulture) } else { 'N/A' }
+        $tokensDisplay = if ($null -ne $item.Tokens) { ([double]$item.Tokens).ToString('N0', [System.Globalization.CultureInfo]::InvariantCulture) } else { 'N/A' }
+        $utilizationMetric = Get-FirstPropertyValue $item.Metrics @('AzureOpenAIProvisionedManagedUtilizationV2','ProvisionedUtilization')
+        $availabilityMetric = Get-FirstPropertyValue $item.Metrics @('AzureOpenAIAvailabilityRate','ModelAvailabilityRate')
+        $utilizationAverage = if ($utilizationMetric -and $null -ne $utilizationMetric.Average) { "$($utilizationMetric.Average)%" } else { 'N/A' }
+        $utilizationMaximum = if ($utilizationMetric -and $null -ne $utilizationMetric.Maximum) { "$($utilizationMetric.Maximum)%" } else { 'N/A' }
+        $availabilityAverage = if ($availabilityMetric -and $null -ne $availabilityMetric.Average) { "$($availabilityMetric.Average)%" } else { 'N/A' }
+        [void]$aiUsageRowsBuilder.Append("<tr class=`"ai-usage-row`"><td><strong>$(ConvertTo-SafeHtml $item.ResourceName)</strong></td><td>$(ConvertTo-SafeHtml $item.Kind)</td><td style=`"text-align:right`">$requestsDisplay</td><td style=`"text-align:right`">$tokensDisplay</td><td style=`"text-align:right`">$utilizationAverage</td><td style=`"text-align:right`">$utilizationMaximum</td><td style=`"text-align:right`">$availabilityAverage</td><td style=`"text-align:center`">$($item.PeriodDays) days</td><td>$(ConvertTo-SafeHtml $item.Subscription)</td></tr>")
+    }
+    $aiUsageRows = $aiUsageRowsBuilder.ToString()
+
+    $copilotRowsBuilder = [System.Text.StringBuilder]::new()
+    foreach ($item in ($githubCopilotData | Sort-Object Organization)) {
+        $status = if ($item.Status) { [string]$item.Status } else { 'Available' }
+        $statusClass = if ($status -eq 'Available') { 'low' } else { 'medium' }
+        $details = if ($status -eq 'Available') { "$($item.CodeAcceptances) acceptances from $($item.CodeGenerations) generations" } else { [string]$item.Reason }
+        [void]$copilotRowsBuilder.Append("<tr class=`"copilot-row`"><td><strong>GitHub Copilot</strong></td><td>$(ConvertTo-SafeHtml $item.Organization)</td><td><span class=`"severity-badge $statusClass`">$(ConvertTo-SafeHtml $status)</span></td><td style=`"text-align:right`">$(if ($status -eq 'Available') { $item.MonthlyActiveUsers } else { 'N/A' })</td><td style=`"text-align:right`">$(if ($status -eq 'Available' -and $null -ne $item.AcceptanceRate) { "$($item.AcceptanceRate)%" } else { 'N/A' })</td><td>28 days</td><td>$(ConvertTo-SafeHtml $details)</td></tr>")
+    }
+    if ($m365CopilotData) {
+        $status = if ($m365CopilotData.Status) { [string]$m365CopilotData.Status } else { 'Unavailable' }
+        $statusClass = if ($status -eq 'Available') { 'low' } else { 'medium' }
+        $scope = if ($m365CopilotData.ReportRefreshDate) { "Tenant (refreshed $($m365CopilotData.ReportRefreshDate))" } else { 'Tenant-wide' }
+        $details = if ($status -eq 'Available') { "$($m365CopilotData.ActiveUsers) active of $($m365CopilotData.EnabledUsers) enabled; Teams $($m365CopilotData.TeamsActiveUsers), Word $($m365CopilotData.WordActiveUsers), Excel $($m365CopilotData.ExcelActiveUsers), Outlook $($m365CopilotData.OutlookActiveUsers), Chat $($m365CopilotData.CopilotChatActiveUsers)" } else { [string]$m365CopilotData.Reason }
+        [void]$copilotRowsBuilder.Append("<tr class=`"copilot-row`"><td><strong>Microsoft 365 Copilot</strong></td><td>$(ConvertTo-SafeHtml $scope)</td><td><span class=`"severity-badge $statusClass`">$(ConvertTo-SafeHtml $status)</span></td><td style=`"text-align:right`">$(if ($status -eq 'Available') { $m365CopilotData.ActiveUsers } else { 'N/A' })</td><td style=`"text-align:right`">$(if ($status -eq 'Available' -and $null -ne $m365CopilotData.AdoptionRate) { "$($m365CopilotData.AdoptionRate)%" } else { 'N/A' })</td><td>$(ConvertTo-SafeHtml $m365CopilotData.Period)</td><td>$(ConvertTo-SafeHtml $details)</td></tr>")
+    }
+    $copilotRows = $copilotRowsBuilder.ToString()
+
+    $aiCopilotFindingsRowsBuilder = [System.Text.StringBuilder]::new()
+    foreach ($finding in ($aiCopilotFindings | Sort-Object @{Expression={ switch($_.Severity) { 'Critical'{0} 'High'{1} 'Medium'{2} 'Low'{3} default{4} } }})) {
+        $severityClass = ([string]$finding.Severity).ToLowerInvariant()
+        [void]$aiCopilotFindingsRowsBuilder.Append("<tr class=`"finding-row`" data-severity=`"$(ConvertTo-SafeHtml $finding.Severity)`" data-category=`"$(ConvertTo-SafeHtml $finding.Category)`"><td><span class=`"severity-badge $severityClass`">$(ConvertTo-SafeHtml $finding.Severity)</span></td><td>$(ConvertTo-SafeHtml $finding.Category)</td><td><strong>$(ConvertTo-SafeHtml $finding.ResourceName)</strong><br><small style=`"color:#0078d4;font-weight:600`">$(ConvertTo-SafeHtml $finding.Subscription)</small></td><td>$(ConvertTo-SafeHtml $finding.Description)</td><td>$(ConvertTo-SafeHtml $finding.Recommendation)</td></tr>")
+    }
+    $aiCopilotFindingsRows = $aiCopilotFindingsRowsBuilder.ToString()
+
     # ── ALZ Readiness blade data ──
     $alzBladeHtml = ""
     # ALZ sidebar link — always shown
@@ -11209,7 +11263,7 @@ function Generate-HTMLReport {
         }
         html, body { margin:0; }
         body { font-family:'Segoe UI',system-ui,sans-serif; font-size:14px; line-height:1.5; background:var(--bg); -webkit-font-smoothing:antialiased; }
-        .container { flex:1; padding:0 32px 32px; background:#fafafa; }
+        .container { flex:1; min-width:0; padding:0 32px 32px; background:#fafafa; }
 
         /* ── Scrollbar ── */
         ::-webkit-scrollbar{width:6px;height:6px}
@@ -11450,6 +11504,7 @@ function Generate-HTMLReport {
             .charts-row{flex-direction:column}
             .chart-card{min-width:auto!important}
             .pillar-grid{grid-template-columns:1fr!important}
+            .ai-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important;width:100%}
         }
     </style>
 </head>
@@ -11561,6 +11616,8 @@ function Generate-HTMLReport {
         <div class="sidebar-section-title">Resources</div>
         <div class="sidebar-group">
             <div class="sidebar-group-items">
+                <a href="#" onclick="navTo('blade-ai-copilot',this,event)">
+                    <span class="sidebar-icon"><svg viewBox="0 0 16 16" fill="none"><path d="M8 1.5a3 3 0 013 3v1h1.5a2 2 0 012 2v2a2 2 0 01-2 2H11v1a3 3 0 01-6 0v-1H3.5a2 2 0 01-2-2v-2a2 2 0 012-2H5v-1a3 3 0 013-3z" stroke="#0078d4" stroke-width="1.1"/><circle cx="6" cy="8.5" r=".8" fill="#0078d4"/><circle cx="10" cy="8.5" r=".8" fill="#0078d4"/></svg></span> Azure AI &amp; Copilot</a>
                 <a href="#" onclick="navTo('blade-marketplace',this,event)">
                     <span class="sidebar-icon"><svg viewBox="0 0 16 16" fill="none"><path d="M2 3h12v2l-1 1H3L2 5V3z" fill="#0078d4"/><path d="M3 6v7h10V6" stroke="#0078d4" stroke-width="1.1" fill="none"/><path d="M6 9h4v4H6z" fill="#0078d4" opacity=".5"/></svg></span> Marketplace</a>
                 <a href="#" onclick="navTo('blade-inventory',this,event)">
@@ -13119,6 +13176,61 @@ $(if ($riTotal -gt 0) { @"
     </div><!-- /blade-databases -->
 
     <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <!-- BLADE: AZURE AI & COPILOT                                             -->
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
+    <div class="blade" id="blade-ai-copilot" style="display:none">
+    <div class="section" id="section-ai-copilot">
+        <div class="section-header" onclick="toggleSection(this)">
+            <h2>Azure AI &amp; Copilot</h2>
+            <span class="toggle">&#9660;</span>
+        </div>
+        <div class="section-content">
+            <div style="background:linear-gradient(135deg,#005a9e 0%,#0078d4 48%,#107c10 100%);border-radius:8px;padding:26px 30px;margin-bottom:24px;box-shadow:0 4px 20px rgba(0,90,158,.2);">
+                <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;">
+                    <div style="flex:1;min-width:220px;">
+                        <div style="font-weight:700;color:#fff;font-size:1.3em;margin-bottom:6px;">AI estate, utilization and adoption</div>
+                        <div style="font-size:.86em;color:rgba(255,255,255,.84);line-height:1.5;">A consolidated view of Azure AI resources, available usage telemetry, and aggregate Copilot adoption. Metrics appear only when their optional collection was enabled and access was available.</div>
+                    </div>
+                    <div class="ai-kpi-grid" style="display:grid;grid-template-columns:repeat(3,minmax(105px,1fr));gap:10px;">
+                        <div style="text-align:center;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);border-radius:8px;padding:12px;"><div style="font-size:1.8em;font-weight:700;color:#fff;">$($aiInventory.Count)</div><div style="font-size:.68em;color:rgba(255,255,255,.82);font-weight:600;">AI RESOURCES</div></div>
+                        <div style="text-align:center;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);border-radius:8px;padding:12px;"><div style="font-size:1.8em;font-weight:700;color:#fff;">$aiDeploymentCount</div><div style="font-size:.68em;color:rgba(255,255,255,.82);font-weight:600;">DEPLOYMENTS</div></div>
+                        <div style="text-align:center;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);border-radius:8px;padding:12px;"><div style="font-size:1.8em;font-weight:700;color:#fff;">$($aiUsage.Count)</div><div style="font-size:.68em;color:rgba(255,255,255,.82);font-weight:600;">METRIC RECORDS</div></div>
+                        <div style="text-align:center;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);border-radius:8px;padding:12px;"><div style="font-size:1.8em;font-weight:700;color:#fff;">$githubCopilotActiveUsers</div><div style="font-size:.68em;color:rgba(255,255,255,.82);font-weight:600;">GITHUB COPILOT MAU</div></div>
+                        <div style="text-align:center;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);border-radius:8px;padding:12px;"><div style="font-size:1.8em;font-weight:700;color:#fff;">$m365CopilotActiveUsers</div><div style="font-size:.68em;color:rgba(255,255,255,.82);font-weight:600;">M365 ACTIVE</div></div>
+                        <div style="text-align:center;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);border-radius:8px;padding:12px;"><div style="font-size:1.8em;font-weight:700;color:#fff;">$($aiCopilotFindings.Count)</div><div style="font-size:.68em;color:rgba(255,255,255,.82);font-weight:600;">FINDINGS</div></div>
+                    </div>
+                </div>
+            </div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px;"><h3 style="margin:0;font-size:14px;">Azure AI Inventory</h3><button class="export-btn" onclick="exportTableCSV('aiInventoryTable')">Download for Excel</button></div>
+            <div class="filters"><input type="text" class="search-box" placeholder="Search AI resources..." oninput="filterTableRows('aiInventoryTable',this.value)" style="margin-left:auto"></div>
+            <div class="table-container" style="margin-bottom:24px;"><table id="aiInventoryTable"><thead><tr><th>Resource</th><th>Resource Group</th><th>Kind</th><th>Model</th><th>SKU</th><th>Region</th><th>Subscription</th></tr></thead><tbody>$aiInventoryRows</tbody></table>$(if ($aiInventory.Count -eq 0) { '<div class="empty-state">No Azure AI resources were detected in the accessible inventory.</div>' })</div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px;"><h3 style="margin:0;font-size:14px;">Azure AI Usage</h3><button class="export-btn" onclick="exportTableCSV('aiUsageTable')">Download for Excel</button></div>
+            <div class="filters"><input type="text" class="search-box" placeholder="Search AI usage..." oninput="filterTableRows('aiUsageTable',this.value)" style="margin-left:auto"></div>
+            <div class="table-container" style="margin-bottom:24px;"><table id="aiUsageTable"><thead><tr><th>Resource</th><th>Kind</th><th>Requests</th><th>Tokens</th><th>PTU Avg.</th><th>PTU Peak</th><th>Availability</th><th>Period</th><th>Subscription</th></tr></thead><tbody>$aiUsageRows</tbody></table>$(if ($aiUsage.Count -eq 0) { '<div class="empty-state">No AI usage metrics were collected. Run with -IncludeAIMetrics to request supported Azure Monitor metrics.</div>' })</div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px;"><h3 style="margin:0;font-size:14px;">Copilot Adoption</h3><button class="export-btn" onclick="exportTableCSV('copilotAdoptionTable')">Download for Excel</button></div>
+            <div class="filters"><input type="text" class="search-box" placeholder="Search Copilot adoption..." oninput="filterTableRows('copilotAdoptionTable',this.value)" style="margin-left:auto"></div>
+            <div class="table-container" style="margin-bottom:24px;"><table id="copilotAdoptionTable"><thead><tr><th>Platform</th><th>Scope</th><th>Status</th><th>Active Users</th><th>Adoption / Acceptance</th><th>Period</th><th>Details</th></tr></thead><tbody>$copilotRows</tbody></table>$(if ($githubCopilotData.Count -eq 0 -and -not $m365CopilotData) { '<div class="empty-state">No Copilot adoption source was enabled for this assessment.</div>' })</div>
+
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px;"><h3 style="margin:0;font-size:14px;">AI &amp; Copilot Findings</h3><button class="export-btn" onclick="exportTableCSV('aiCopilotFindingsTable')">Download for Excel</button></div>
+            <div class="filters">
+                <strong style="font-size:.85em;color:var(--text-dim);">Severity:</strong>
+                <button class="filter-btn active" onclick="filterFindings('all',this)">All</button>
+                <button class="filter-btn sev-critical" onclick="filterFindings('Critical',this)">Critical</button>
+                <button class="filter-btn sev-high" onclick="filterFindings('High',this)">High</button>
+                <button class="filter-btn sev-medium" onclick="filterFindings('Medium',this)">Medium</button>
+                <button class="filter-btn sev-low" onclick="filterFindings('Low',this)">Low</button>
+                <button class="filter-btn" onclick="filterFindings('Info',this)">Info</button>
+                <input type="text" class="search-box" placeholder="Search findings..." oninput="searchFindings(this.value,this)" style="margin-left:auto">
+            </div>
+            <div class="table-container"><table id="aiCopilotFindingsTable"><thead><tr><th>Severity</th><th>Category</th><th>Resource</th><th>Finding</th><th>Recommendation</th></tr></thead><tbody>$aiCopilotFindingsRows</tbody></table>$(if ($aiCopilotFindings.Count -eq 0) { '<div class="empty-state">No AI or Copilot findings were generated.</div>' })</div>
+        </div>
+    </div>
+    </div><!-- /blade-ai-copilot -->
+
+    <!-- ═══════════════════════════════════════════════════════════════════════ -->
     <!-- BLADE: MARKETPLACE DEPLOYED PRODUCTS                                  -->
     <!-- ═══════════════════════════════════════════════════════════════════════ -->
     <div class="blade" id="blade-marketplace" style="display:none">
@@ -13377,6 +13489,7 @@ function navTo(id, el, e) {
             if (searchBox) searchBox.value = '';
         });
         blade.querySelectorAll('.finding-row').forEach(function(r){ r.style.display = ''; });
+        blade.querySelectorAll('.ai-inventory-row,.ai-usage-row,.copilot-row').forEach(function(r){ r.style.display = ''; });
     }
     // Scroll to top
     window.scrollTo(0, 0);
@@ -13738,6 +13851,15 @@ function exportTableCSV(tableId) {
     link.download = 'Azure_Assessment_' + sectionName + '.csv';
     link.click();
     URL.revokeObjectURL(link.href);
+}
+
+function filterTableRows(tableId, query) {
+    var table = document.getElementById(tableId);
+    if (!table) return;
+    var normalized = (query || '').toLowerCase();
+    table.querySelectorAll('tbody tr').forEach(function(row) {
+        row.style.display = !normalized || row.textContent.toLowerCase().includes(normalized) ? '' : 'none';
+    });
 }
 
 // ── Inventory subscription filter ──────────────────────────────────────────
@@ -16731,8 +16853,8 @@ try {
 # SIG # Begin signature block
 # MIIFrQYJKoZIhvcNAQcCoIIFnjCCBZoCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD96hdM1xu9L2Pr
-# f/KH88n5Ua6gX0Qx7pLBJ/1OaNeGZKCCAxowggMWMIIB/qADAgECAhB05LE1IRL+
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBZL9XofPgovu+M
+# O6rOW3iRfYDYJEcNI6MykdiqTMhAuKCCAxowggMWMIIB/qADAgECAhB05LE1IRL+
 # rkeuEM34A+X/MA0GCSqGSIb3DQEBCwUAMCMxITAfBgNVBAMMGFBhYmxvQVIgQXp1
 # cmUgQXNzZXNzbWVudDAeFw0yNjA1MjMwMTM5MDdaFw0zMTA1MjMwMTQ5MDRaMCMx
 # ITAfBgNVBAMMGFBhYmxvQVIgQXp1cmUgQXNzZXNzbWVudDCCASIwDQYJKoZIhvcN
@@ -16752,12 +16874,12 @@ try {
 # Zp7z6zGCAekwggHlAgEBMDcwIzEhMB8GA1UEAwwYUGFibG9BUiBBenVyZSBBc3Nl
 # c3NtZW50AhB05LE1IRL+rkeuEM34A+X/MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisG
 # AQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQw
-# HAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIIxS
-# zkwtl36NbDJ561hKK9HM3k7PfJB47caHQCOILORgMA0GCSqGSIb3DQEBAQUABIIB
-# AKZLdQXrU6KbGF/7cKWl0SkuaTro7bbT5ZbMplu/8eRr5tbg9byUHXDKDmNc6Zyf
-# cdTS/30ZtpgMD0gcj8v9pEgRiXJfKGCBnkww+Rv2qsRh6+rpua4Vhci5lIsRauLu
-# pbBhZZ47776jWzS8iqw63LZ5SF/92A7rOeXcnAizCMviyiDnr0JrAa0fA61yMy28
-# acXq75B6dQfQ2Gqxyq8tlMFGyDAOD9zDVEEVLwhuQj7MQ3klCVKJxnu+Pf+8Eigm
-# L4RIPGHjIo3BHJ7RHzxGWrdQj7BBqUf+c8aMtUg+vI8bd0LgmRar7ueiqQJ7ugIv
-# RPLK2EfeNi2SyXY7/9P3iek=
+# HAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIH4n
+# wBZte1/LjVN18/gDCIw00X6Ox1Xxuhd4s8LE1EvjMA0GCSqGSIb3DQEBAQUABIIB
+# AGehlMPaOyu3b0x9dhLct1UFD7qju62VI/+nYHk+MlijVyOCIyfGQiY7ML9WcGej
+# ePqylFEhaFuRsaWvEhfqR0excBdnUuP4+pVHMCQvdVMqDoxqRaxB0bYLHob470k/
+# k+/P5iR6zU+sD9W6WEnDCism27e8iT0ncePfoosvfoaTNDUFc/N1rOSn0CJNORqk
+# xqgjNY/FW6vS5ne08ujFytOxamuj4ZMhKhx+tEU0x9F8XUP2G/XcPxUh7vQUF/Wz
+# Vs/reJ+MudUPPBv+cUQq72+xlF/6PsiikPrdEuzOxxhZuwZz87Devml2TujJU1e0
+# 9bTQtzips1qJ+qAbWNPZBwo=
 # SIG # End signature block

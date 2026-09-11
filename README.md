@@ -2,7 +2,7 @@
 
 **Automated Azure tenant-wide analysis aligned with the Microsoft Azure Well-Architected Framework (WAF), Zero Trust security model, and Azure Landing Zone (ALZ) best practices.**
 
-**Current release:** [v5.7](https://github.com/ms-pabloar/Azure-Tenant-Assessment/releases/tag/v5.7)
+**Current release:** [v5.8](https://github.com/ms-pabloar/Azure-Tenant-Assessment/releases/tag/v5.8)
 
 > **This script is read-only and does NOT deploy, modify, create, or delete any Azure resource.** It performs analysis exclusively through read-only API calls (`GET` requests and Azure Resource Graph queries). Your environment remains completely unchanged after execution.
 
@@ -26,6 +26,7 @@ It evaluates **every subscription** the authenticated identity has access to, an
 - **Tag compliance analysis** against configurable mandatory tags
 - **Expiring secrets and certificates** detection in Key Vaults (30/60/90-day windows)
 - **Private endpoint adoption** tracking across supported services
+- **Dedicated Azure AI & Copilot blade** with AI resource inventory, request/token/PTU/availability metrics, aggregate GitHub and Microsoft 365 Copilot adoption, searchable tables, and Excel-compatible exports
 
 ---
 
@@ -35,7 +36,7 @@ The script generates **7 files** in a timestamped output directory:
 
 | File | Description |
 |------|-------------|
-| `Assessment_Report.html` | Full interactive report with 16 blade sections, severity/pillar/category filters, search, and export capabilities |
+| `Assessment_Report.html` | Full interactive report with 17 blade sections, including Azure AI inventory and usage plus GitHub/Microsoft 365 Copilot adoption, searchable tables, and Excel-compatible CSV exports |
 | `Executive_Report.html` | Concise executive summary optimized for PDF generation (Ctrl+P in Chrome/Edge) |
 | `Network_Topology.html` | Interactive SVG network diagram — VNets, subnets, peering, public IPs, NAT Gateways, edge devices |
 | `Network_Topology.drawio` | Same topology in editable Draw.io format (open at [draw.io](https://app.diagrams.net)) |

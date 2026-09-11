@@ -286,6 +286,20 @@ Describe 'Inventory and analysis cache reuse' {
         $summary.AcceptanceRate | Should Be 25
     }
 
+    It 'renders a dedicated Azure AI and Copilot blade with Excel-compatible exports' {
+        $text = Get-FunctionText 'Generate-HTMLReport'
+        $text | Should Match 'id="blade-ai-copilot"'
+        $text | Should Match "navTo\('blade-ai-copilot'"
+        $text | Should Match 'id="aiInventoryTable"'
+        $text | Should Match 'id="aiUsageTable"'
+        $text | Should Match 'id="copilotAdoptionTable"'
+        $text | Should Match 'id="aiCopilotFindingsTable"'
+        $text | Should Match '<th>PTU Avg\.</th><th>PTU Peak</th><th>Availability</th>'
+        $text | Should Match '<th>Resource</th><th>Resource Group</th><th>Kind</th>'
+        ([regex]::Matches($text, "exportTableCSV\('(?:aiInventoryTable|aiUsageTable|copilotAdoptionTable|aiCopilotFindingsTable)'\)")).Count | Should Be 4
+        $text | Should Match 'function filterTableRows'
+    }
+
     It 'accepts GitHub Copilot NDJSON report downloads' {
         $report = '{"day_totals":[{"day":"2026-09-10","monthly_active_users":7,"code_generation_activity_count":10,"code_acceptance_activity_count":4}]}'
 
