@@ -237,6 +237,16 @@ Describe 'Inventory and analysis cache reuse' {
         (Get-FunctionText 'Analyze-Marketplace') | Should Match 'ToUniversalTime\(\)\.Date'
     }
 
+    It 'shows one tenant-wide cost view until a subscription is selected' {
+        $text = Get-FunctionText 'Generate-HTMLReport'
+        $text | Should Match '\$costDataByCurrency = @\{\}'
+        $text | Should Match "Scope = 'tenant'"
+        $text | Should Match 'data-cost-scope="\$\(\$s\.Scope\)"'
+        $text | Should Match 'display:\$\(if \(\$s\.Scope -eq ''tenant''\) \{ ''block'' \} else \{ ''none'' \}\)'
+        $text | Should Match "s\.dataset\.costScope === 'tenant'"
+        $text | Should Match "nameEl\.textContent = 'Entire tenant'"
+    }
+
     It 'keeps cached RBAC shape consistent and filters at Resource Graph' {
         $zeroTrustText = Get-FunctionText 'Analyze-ZeroTrust'
         $additionalText = Get-FunctionText 'Analyze-AdditionalChecks'

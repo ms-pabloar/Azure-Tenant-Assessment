@@ -17,7 +17,7 @@
     - Complete inventory of resources, configurations, and detected issues
 .NOTES
     Author: Azure Assessment Tool
-    Version: 5.8
+    Version: 5.9
     Requiere: Az PowerShell Modules (Az.Accounts, Az.Compute, Az.Network, Az.Sql,
               Az.Storage, Az.KeyVault, Az.Monitor, Az.Security, Az.Aks,
               Az.OperationalInsights, Az.RecoveryServices, Az.ResourceGraph)
@@ -9493,11 +9493,63 @@ function Generate-HTMLReport {
     }
     $subRows = $subBuilder.ToString()
 
-    # Cost analysis HTML per subscription
+    # Cost analysis views: tenant-wide by currency, followed by individual subscriptions.
+    # Costs in different currencies are intentionally kept separate.
+    $costViews = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $costDataByCurrency = @{}
+    foreach ($costInfo in @($script:CostData.Values | Where-Object { $_ })) {
+        $currencyKey = if ($costInfo.Currency) { [string]$costInfo.Currency } else { 'USD' }
+        if (-not $costDataByCurrency.ContainsKey($currencyKey)) {
+            $costDataByCurrency[$currencyKey] = @{
+                TotalByService = @{}
+                MonthlyByService = @{}
+                Months = [System.Collections.Generic.SortedSet[string]]::new()
+            }
+        }
+        $aggregate = $costDataByCurrency[$currencyKey]
+        foreach ($month in @($costInfo.Months)) { [void]$aggregate.Months.Add([string]$month) }
+        foreach ($service in @($costInfo.MonthlyByService.Keys)) {
+            if (-not $aggregate.MonthlyByService.ContainsKey($service)) { $aggregate.MonthlyByService[$service] = @{} }
+            foreach ($month in @($costInfo.MonthlyByService[$service].Keys)) {
+                $value = [double]$costInfo.MonthlyByService[$service][$month]
+                if (-not $aggregate.MonthlyByService[$service].ContainsKey($month)) { $aggregate.MonthlyByService[$service][$month] = 0 }
+                $aggregate.MonthlyByService[$service][$month] += $value
+                if (-not $aggregate.TotalByService.ContainsKey($service)) { $aggregate.TotalByService[$service] = 0 }
+                $aggregate.TotalByService[$service] += $value
+            }
+        }
+    }
+    foreach ($currencyKey in @($costDataByCurrency.Keys | Sort-Object)) {
+        $aggregate = $costDataByCurrency[$currencyKey]
+        $months = @($aggregate.Months)
+        $topServices = @($aggregate.TotalByService.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 10)
+        $growth = @{}
+        if ($months.Count -ge 2) {
+            foreach ($service in $topServices) {
+                $firstValue = if ($aggregate.MonthlyByService[$service.Key].ContainsKey($months[0])) { [double]$aggregate.MonthlyByService[$service.Key][$months[0]] } else { 0 }
+                $lastValue = if ($aggregate.MonthlyByService[$service.Key].ContainsKey($months[-1])) { [double]$aggregate.MonthlyByService[$service.Key][$months[-1]] } else { 0 }
+                $growth[$service.Key] = if ($firstValue -gt 0) { [math]::Round((($lastValue - $firstValue) / $firstValue) * 100, 1) } elseif ($lastValue -gt 0) { 100 } else { 0 }
+            }
+        }
+        $tenantCostInfo = @{
+            TotalCost = [math]::Round((($aggregate.TotalByService.Values | Measure-Object -Sum).Sum), 2)
+            TopServices = $topServices
+            MonthlyByService = $aggregate.MonthlyByService
+            Months = $months
+            Growth = $growth
+            Currency = $currencyKey
+        }
+        $costViews.Add([PSCustomObject]@{ Id = "tenant:$currencyKey"; Name = "Entire Tenant ($currencyKey)"; CostInfo = $tenantCostInfo; Scope = 'tenant' })
+    }
+    foreach ($subscription in $script:Subscriptions) {
+        if ($script:CostData[$subscription.Id]) {
+            $costViews.Add([PSCustomObject]@{ Id = $subscription.Id; Name = $subscription.Name; CostInfo = $script:CostData[$subscription.Id]; Scope = 'subscription' })
+        }
+    }
+
     $costAnalysisHtml = [System.Text.StringBuilder]::new()
-    foreach ($s in $script:Subscriptions) {
-        $costInfo = $script:CostData[$s.Id]
-        if (-not $costInfo) { continue }
+    foreach ($s in $costViews) {
+        $costInfo = $s.CostInfo
 
         $safeName = ConvertTo-SafeHtml $s.Name
         $currency = $costInfo.Currency
@@ -9625,7 +9677,7 @@ function Generate-HTMLReport {
         }
 
         [void]$costAnalysisHtml.AppendLine(@"
-        <div class="cost-sub-section" data-subid="$($s.Id)" data-monthly="[$( ($months | ForEach-Object { $m = $_; $total = 0; foreach ($svc in $costInfo.TopServices) { if ($costInfo.MonthlyByService.ContainsKey($svc.Key) -and $costInfo.MonthlyByService[$svc.Key].ContainsKey($m)) { $total += [double]$costInfo.MonthlyByService[$svc.Key][$m] } }; [math]::Round($total, 0) }) -join ',' )]" style="margin-bottom:32px;border:1px solid var(--border);border-radius:12px;padding:24px;background:var(--surface);box-shadow:var(--shadow-sm);">
+        <div class="cost-sub-section" data-cost-scope="$($s.Scope)" data-subid="$($s.Id)" data-monthly="[$( ($months | ForEach-Object { $m = $_; $total = 0; foreach ($svc in $costInfo.TopServices) { if ($costInfo.MonthlyByService.ContainsKey($svc.Key) -and $costInfo.MonthlyByService[$svc.Key].ContainsKey($m)) { $total += [double]$costInfo.MonthlyByService[$svc.Key][$m] } }; [math]::Round($total, 0) }) -join ',' )]" style="display:$(if ($s.Scope -eq 'tenant') { 'block' } else { 'none' });margin-bottom:32px;border:1px solid var(--border);border-radius:12px;padding:24px;background:var(--surface);box-shadow:var(--shadow-sm);">
             <!-- Subscription Header -->
             <h3 style="font-size:16px;font-weight:700;color:var(--text);margin-bottom:20px;padding-bottom:12px;border-bottom:2px solid var(--accent);">&#128176; $safeName</h3>
 
@@ -12239,9 +12291,9 @@ function Generate-HTMLReport {
             <span class="toggle">&#9660;</span>
         </div>
         <div class="section-content">
-            <div id="sub-filter-bar" style="display:none;margin-bottom:14px;padding:10px 16px;background:linear-gradient(90deg,#e8f4fd,#f0f6ff);border:1px solid #b3d7f2;border-radius:8px;font-size:.88em;color:#0078d4;align-items:center;gap:10px;">
-                <span>&#128205; Showing cost data for: <strong id="sub-filter-name"></strong></span>
-                <button onclick="clearSubCostFilter()" style="margin-left:auto;background:#0078d4;color:#fff;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:.85em;font-weight:600;">Show All</button>
+            <div id="sub-filter-bar" style="display:flex;margin-bottom:14px;padding:10px 16px;background:linear-gradient(90deg,#e8f4fd,#f0f6ff);border:1px solid #b3d7f2;border-radius:8px;font-size:.88em;color:#0078d4;align-items:center;gap:10px;">
+                <span>&#128205; Showing cost data for: <strong id="sub-filter-name">Entire tenant</strong></span>
+                <button id="sub-filter-clear" onclick="clearSubCostFilter()" style="display:none;margin-left:auto;background:#0078d4;color:#fff;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:.85em;font-weight:600;">Show entire tenant</button>
             </div>
             <table id="subsTable">
                 <thead><tr><th>Name</th><th>ID</th><th>Status</th><th>Cost (6 months)</th></tr></thead>
@@ -13539,11 +13591,10 @@ function selectSubCost(row) {
     rows.forEach(function(r) { r.classList.remove('sub-selected'); r.style.background = ''; });
     row.classList.add('sub-selected');
     row.style.background = 'linear-gradient(90deg,#e8f4fd,#f0f6ff)';
-    // Show filter bar
-    var bar = document.getElementById('sub-filter-bar');
-    if (bar) { bar.style.display = 'flex'; }
     var nameEl = document.getElementById('sub-filter-name');
     if (nameEl) { nameEl.textContent = row.querySelector('td strong') ? row.querySelector('td strong').textContent : subId; }
+    var clearButton = document.getElementById('sub-filter-clear');
+    if (clearButton) { clearButton.style.display = ''; }
     // Filter cost sections
     var sections = document.querySelectorAll('.cost-sub-section[data-subid]');
     sections.forEach(function(s) {
@@ -13557,10 +13608,12 @@ function clearSubCostFilter() {
     var tbl = document.getElementById('subsTable');
     var rows = tbl ? tbl.querySelectorAll('tr[data-subid]') : [];
     rows.forEach(function(r) { r.classList.remove('sub-selected'); r.style.background = ''; });
-    var bar = document.getElementById('sub-filter-bar');
-    if (bar) { bar.style.display = 'none'; }
+    var nameEl = document.getElementById('sub-filter-name');
+    if (nameEl) { nameEl.textContent = 'Entire tenant'; }
+    var clearButton = document.getElementById('sub-filter-clear');
+    if (clearButton) { clearButton.style.display = 'none'; }
     var sections = document.querySelectorAll('.cost-sub-section[data-subid]');
-    sections.forEach(function(s) { s.style.display = ''; });
+    sections.forEach(function(s) { s.style.display = (s.dataset.costScope === 'tenant') ? '' : 'none'; });
 }
 
 // ── Zero Trust: initialise counters and wire up rows ──────────────────────

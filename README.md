@@ -2,7 +2,7 @@
 
 **Automated Azure tenant-wide analysis aligned with the Microsoft Azure Well-Architected Framework (WAF), Zero Trust security model, and Azure Landing Zone (ALZ) best practices.**
 
-**Current release:** [v5.8](https://github.com/ms-pabloar/Azure-Tenant-Assessment/releases/tag/v5.8)
+**Current release:** [v5.9](https://github.com/ms-pabloar/Azure-Tenant-Assessment/releases/tag/v5.9)
 
 > **This script is read-only and does NOT deploy, modify, create, or delete any Azure resource.** It performs analysis exclusively through read-only API calls (`GET` requests and Azure Resource Graph queries). Your environment remains completely unchanged after execution.
 
@@ -18,7 +18,7 @@ It evaluates **every subscription** the authenticated identity has access to, an
 
 - **30+ specialized analysis functions** covering networking, compute, databases, storage, identity, containers, monitoring, BCDR, cost, modernization, and more
 - **Real Azure Monitor metrics** (CPU, network, DTU, IOPS, requests) to identify underutilized and idle resources
-- **6-month cost trend analysis** per subscription, broken down by service, with monthly sparklines
+- **6-month cost trend analysis** with a tenant-wide default view, currency-safe aggregation, and on-demand subscription filtering by service, heatmap, and monthly sparklines
 - **Reservation and Savings Plan purchase analysis** using Azure-calculated 30/60-day usage, hourly commitments, coverage, utilization, and projected savings
 - **Network topology visualization** — interactive SVG diagram showing VNets, subnets, NSGs, peering connections, public IPs, NAT Gateways, and internet egress paths
 - **Zero Trust maturity assessment** across Network, Compute, and Platform layers
